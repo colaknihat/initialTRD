@@ -1,0 +1,10 @@
+{
+  "action": "CLOSE",
+  "reason": "spread mean reversion target reached",
+  "z_score": -0.45672739371255144,
+  "regime": 1,
+  "predicted_return": 0.0011905096471309662,
+  "long_leg": null,
+  "short_leg": null,
+  "prediction_source": "model"
+}
