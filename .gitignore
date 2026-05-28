@@ -1,22 +1,57 @@
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
+*$py.class
 
+# Virtual environments
 .venv/
 venv/
-*.egg-info/
+env/
+ENV/
 
+# Build and package outputs
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test, lint, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project-generated market data, models, and reports
 data/
 artifacts/
-
 *.pt
 *.pt.json
-features.csv
-features_weighted.csv
 raw_market.csv
 stock_a.csv
 stock_b.csv
+features.csv
+features_weighted.csv
 walk_forward_results.csv
 strategy_signal.json
 epoch_tuning.csv
 epoch_tuning.json
 pipeline_summary.json
+pair_backtest_*.csv
+pair_backtest_*_summary.json

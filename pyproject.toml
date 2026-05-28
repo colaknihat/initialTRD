@@ -29,6 +29,7 @@ trd-tune-epochs = "initial_trd.cli.tune_epochs:main"
 trd-walk-forward = "initial_trd.cli.walk_forward:main"
 trd-signal = "initial_trd.cli.signal:main"
 trd-run-pipeline = "initial_trd.cli.pipeline:main"
+trd-backtest-pairs = "initial_trd.cli.backtest_pairs:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

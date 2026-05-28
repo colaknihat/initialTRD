@@ -8,6 +8,7 @@ from initial_trd.strategy import (
     Regime,
     classify_regime,
     execute_pairs_trade,
+    generate_pairs_trade_signal,
     predict_momentum,
 )
 
@@ -123,6 +124,34 @@ class TradingStrategyTests(unittest.TestCase):
 
         self.assertEqual(instruction.action, "CLOSE")
         self.assertEqual(closed, [True])
+
+    def test_pair_signal_aligns_dataframe_closes_by_date(self):
+        stock_a = pd.DataFrame(
+            {
+                "date": ["2026-01-01", "2026-01-02", "2026-01-03"],
+                "close": [100.0, 200.0, 300.0],
+            }
+        )
+        stock_b = pd.DataFrame(
+            {
+                "date": ["2026-01-01", "2026-01-03"],
+                "close": [90.0, 290.0],
+            }
+        )
+
+        instruction = generate_pairs_trade_signal(
+            stock_a,
+            stock_b,
+            Regime.DISINFLATION,
+            0.01,
+            window=2,
+        )
+
+        self.assertEqual(instruction.action, "HOLD")
+        self.assertEqual(
+            instruction.reason,
+            "z-score is unavailable for the latest window",
+        )
 
 
 if __name__ == "__main__":

@@ -322,21 +322,49 @@ def _to_numpy(data: Any, name: str) -> np.ndarray:
 def _extract_close_series(stock: Any, name: str) -> pd.Series:
     if isinstance(stock, pd.Series):
         close = stock
+        date_index = None
     else:
         try:
             close = stock["close"]
         except (KeyError, TypeError) as exc:
             raise ValueError(f"{name} must be a Series or include a 'close' column") from exc
+        date_index = _extract_date_index(stock, name)
 
     try:
-        series = pd.Series(close, dtype=float)
+        if date_index is None:
+            series = pd.Series(close, dtype=float)
+        else:
+            series = pd.Series(np.asarray(close), index=date_index, dtype=float)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} close prices must be numeric") from exc
 
     if series.empty:
         raise ValueError(f"{name} close prices cannot be empty")
+    if series.index.has_duplicates:
+        raise ValueError(f"{name} close price dates must be unique")
 
-    return series
+    return series.sort_index()
+
+
+def _extract_date_index(stock: Any, name: str) -> Optional[pd.DatetimeIndex]:
+    if not isinstance(stock, pd.DataFrame):
+        return None
+
+    for column in ("date", "Date", "datetime", "Datetime", "Unnamed: 0"):
+        if column in stock.columns:
+            return _parse_date_index(stock[column], f"{name} {column}")
+
+    if isinstance(stock.index, pd.DatetimeIndex):
+        return stock.index
+
+    return None
+
+
+def _parse_date_index(values: Any, name: str) -> pd.DatetimeIndex:
+    parsed = pd.to_datetime(values, errors="coerce")
+    if pd.isna(parsed).any():
+        raise ValueError(f"{name} must contain valid dates")
+    return pd.DatetimeIndex(parsed)
 
 
 def _to_scalar_float(value: Any, name: str) -> float:

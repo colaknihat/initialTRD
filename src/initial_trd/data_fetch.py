@@ -35,6 +35,28 @@ def _download_close(tickers, *, start_date: str, end_date: str):
     return close
 
 
+def fetch_stock_closes(
+    tickers: tuple[str, ...],
+    *,
+    start_date: str = START_DATE,
+    end_date: str = END_DATE,
+) -> pd.DataFrame:
+    """Download one shared close-price frame for a stock universe."""
+
+    ticker_list = _dedupe_tickers(tickers)
+    if len(ticker_list) < 2:
+        raise ValueError("at least two tickers are required")
+
+    closes = _download_close(ticker_list, start_date=start_date, end_date=end_date)
+    if isinstance(closes, pd.Series):
+        closes = closes.to_frame(ticker_list[0])
+
+    closes = closes.reindex(columns=ticker_list)
+    closes.index = pd.to_datetime(closes.index)
+    closes.index.name = "date"
+    return closes.sort_index()
+
+
 def fetch_and_align_data(
     *,
     stock_a_ticker: str = DEFAULT_STOCK_A_TICKER,
