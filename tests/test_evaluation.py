@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from model_testing import (
+from initial_trd.evaluation import (
     PurgedWalkForward,
     calculate_directional_accuracy,
     calculate_max_drawdown,

@@ -3,8 +3,14 @@
   "reason": "spread mean reversion target reached",
   "z_score": -0.45672739371255144,
   "regime": 1,
-  "predicted_return": 0.0011905096471309662,
+  "predicted_return": -0.003813450690358877,
   "long_leg": null,
   "short_leg": null,
+  "stock_a_name": "THYAO.IS",
+  "stock_b_name": "PGSUS.IS",
+  "stock_a_ticker": "THYAO.IS",
+  "stock_b_ticker": "PGSUS.IS",
+  "stock_a_path": "C:\\Users\\colakos\\Desktop\\initialTRD\\data\\stock_a.csv",
+  "stock_b_path": "C:\\Users\\colakos\\Desktop\\initialTRD\\data\\stock_b.csv",
   "prediction_source": "model"
 }

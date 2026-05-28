@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "initial-trd"
+version = "0.1.0"
+description = "Research-oriented Turkish market trading strategy prototype."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+    "yfinance",
+]
+
+[project.optional-dependencies]
+hmm = ["hmmlearn"]
+tensorflow = ["tensorflow"]
+sklearn = ["scikit-learn"]
+all = ["hmmlearn", "tensorflow", "scikit-learn"]
+
+[project.scripts]
+trd-fetch-data = "initial_trd.data_fetch:main"
+trd-engineer-features = "initial_trd.cli.feature_engineering:main"
+trd-train-lstm = "initial_trd.cli.train_lstm:main"
+trd-tune-epochs = "initial_trd.cli.tune_epochs:main"
+trd-walk-forward = "initial_trd.cli.walk_forward:main"
+trd-signal = "initial_trd.cli.signal:main"
+trd-run-pipeline = "initial_trd.cli.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

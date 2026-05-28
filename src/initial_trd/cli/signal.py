@@ -4,20 +4,12 @@ import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
-import sys
 
 import numpy as np
 import pandas as pd
 import torch
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from trading_strategy import execute_pairs_trade
-from train_model import BISTResilientLSTM
-from project_paths import (
+from initial_trd.paths import (
     FEATURES_PATH,
     MODEL_PATH,
     STOCK_A_PATH,
@@ -27,6 +19,8 @@ from project_paths import (
     first_existing_path,
     resolve_project_path,
 )
+from initial_trd.strategy import execute_pairs_trade
+from initial_trd.training import BISTResilientLSTM
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=MODEL_PATH,
-        help="Optional .pt model produced by scripts/run_lstm_training.py.",
+        help="Optional .pt model produced by trd-train-lstm.",
     )
     parser.add_argument(
         "--features-input",
@@ -71,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=STRATEGY_SIGNAL_PATH,
-        help="JSON output path. Relative paths are resolved from the project root.",
+        help="JSON output path. Relative paths are resolved from the current working directory.",
     )
     parser.add_argument("--device", default="cpu")
     return parser.parse_args()
@@ -84,7 +78,7 @@ def main() -> None:
     if not stock_a_path.exists() or not stock_b_path.exists():
         raise FileNotFoundError(
             f"{stock_a_path} or {stock_b_path} does not exist. "
-            "Run fetch_and_align_data.py first or pass --stock-a and --stock-b."
+            "Run trd-fetch-data first or pass --stock-a and --stock-b."
         )
 
     stock_a = pd.read_csv(stock_a_path)
@@ -104,6 +98,10 @@ def main() -> None:
     )
 
     payload = asdict(instruction)
+    payload["stock_a_name"] = args.stock_a_name
+    payload["stock_b_name"] = args.stock_b_name
+    payload["stock_a_path"] = str(stock_a_path)
+    payload["stock_b_path"] = str(stock_b_path)
     payload["prediction_source"] = "argument" if args.prediction is not None else "model"
     output = json.dumps(payload, indent=2)
     print(output)
@@ -128,11 +126,11 @@ def resolve_prediction(args: argparse.Namespace) -> float:
     if not model_path.exists():
         raise FileNotFoundError(
             f"{model_path} does not exist. Provide --prediction or run "
-            "scripts/run_lstm_training.py first."
+            "trd-train-lstm first."
         )
     if not features_path.exists():
         raise FileNotFoundError(
-            f"{features_path} does not exist. Run scripts/run_feature_engineering.py "
+            f"{features_path} does not exist. Run trd-engineer-features "
             "first or pass --features-input."
         )
 

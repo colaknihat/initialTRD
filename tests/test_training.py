@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from train_model import (
+from initial_trd.training import (
     BISTResilientLSTM,
     RegimeWeightedHuberLoss,
     create_purged_folds,

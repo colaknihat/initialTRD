@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from trading_strategy import (
+from initial_trd.strategy import (
     Regime,
     classify_regime,
     execute_pairs_trade,

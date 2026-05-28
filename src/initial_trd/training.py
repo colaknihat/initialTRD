@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Iterable, Optional
 
 import numpy as np
@@ -153,12 +154,19 @@ def train_bist_model(
     weight_decay: float = 1e-4,
     max_grad_norm: float = 1.0,
     device: Optional[torch.device | str] = None,
+    early_stopping_patience: Optional[int] = None,
+    min_delta: float = 0.0,
+    restore_best_state: bool = False,
     verbose: bool = True,
 ) -> list[dict[str, float]]:
     """Train the BIST model with weighted Huber loss and gradient clipping."""
 
     if epochs <= 0:
         raise ValueError("epochs must be positive")
+    if early_stopping_patience is not None and early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1")
+    if min_delta < 0.0:
+        raise ValueError("min_delta cannot be negative")
 
     device_obj = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device_obj)
@@ -167,6 +175,9 @@ def train_bist_model(
     criterion = RegimeWeightedHuberLoss(delta=1.5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
     history: list[dict[str, float]] = []
+    best_val_loss = float("inf")
+    best_state: Optional[dict[str, torch.Tensor]] = None
+    epochs_without_improvement = 0
 
     for epoch in range(epochs):
         model.train()
@@ -204,12 +215,34 @@ def train_bist_model(
         }
         history.append(epoch_metrics)
 
+        if val_loss < best_val_loss - min_delta:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            if restore_best_state:
+                best_state = copy.deepcopy(model.state_dict())
+        else:
+            epochs_without_improvement += 1
+
         if verbose:
             print(
                 f"Epoch {epoch + 1} | "
                 f"Train Loss: {train_loss:.4f} | "
                 f"Val Loss: {val_loss:.4f}"
             )
+
+        if (
+            early_stopping_patience is not None
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            if verbose:
+                print(
+                    "Early stopping: "
+                    f"validation loss did not improve for {early_stopping_patience} epochs"
+                )
+            break
+
+    if restore_best_state and best_state is not None:
+        model.load_state_dict(best_state)
 
     return history
 
