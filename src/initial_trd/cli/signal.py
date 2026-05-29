@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Engineered CSV used for model prediction. Defaults to "
-            "artifacts/features_weighted.csv if it exists, otherwise artifacts/features.csv."
+            "artifacts/features.csv if it exists, otherwise artifacts/features_weighted.csv."
         ),
     )
     parser.add_argument(
@@ -120,7 +120,7 @@ def resolve_prediction(args: argparse.Namespace) -> float:
     features_path = (
         resolve_project_path(args.features_input)
         if args.features_input
-        else first_existing_path(WEIGHTED_FEATURES_PATH, FEATURES_PATH)
+        else first_existing_path(FEATURES_PATH, WEIGHTED_FEATURES_PATH)
     )
 
     if not model_path.exists():

@@ -33,8 +33,8 @@ def parse_args() -> argparse.Namespace:
         "--input",
         default=None,
         help=(
-            "Engineered input CSV path. Defaults to artifacts/features_weighted.csv "
-            "if it exists, otherwise artifacts/features.csv."
+            "Engineered input CSV path. Defaults to artifacts/features.csv "
+            "if it exists, otherwise artifacts/features_weighted.csv."
         ),
     )
     parser.add_argument(
@@ -99,7 +99,7 @@ def main() -> None:
     input_path = (
         resolve_project_path(args.input)
         if args.input
-        else first_existing_path(WEIGHTED_FEATURES_PATH, FEATURES_PATH)
+        else first_existing_path(FEATURES_PATH, WEIGHTED_FEATURES_PATH)
     )
     output_path = resolve_project_path(args.output)
     summary_output_path = resolve_project_path(args.summary_output)

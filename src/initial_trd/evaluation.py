@@ -74,8 +74,10 @@ def run_walk_forward_test(
     """Train fresh models on purged walk-forward folds and report real returns."""
 
     _require_columns(df, tuple(features) + (target,))
-    x = df.loc[:, features].to_numpy(dtype=float)
-    y = df.loc[:, target].to_numpy(dtype=float)
+    columns = list(dict.fromkeys([*features, target]))
+    working = df.loc[:, columns].replace([np.inf, -np.inf], np.nan).dropna()
+    x = working.loc[:, features].to_numpy(dtype=float)
+    y = working.loc[:, target].to_numpy(dtype=float)
 
     if len(x) == 0:
         raise ValueError("df must contain at least one row")
@@ -246,4 +248,3 @@ def _require_same_length(
 ) -> None:
     if len(left) != len(right):
         raise ValueError(f"{left_name} and {right_name} must have the same length")
-

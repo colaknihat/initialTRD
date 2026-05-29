@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also add HMM regime and sample_weight columns. Requires hmmlearn.",
     )
+    parser.add_argument("--target-horizon", type=int, default=1)
     parser.add_argument("--n-components", type=int, default=4)
     parser.add_argument("--random-state", type=int, default=None)
     return parser.parse_args()
@@ -57,7 +58,7 @@ def main() -> None:
         )
 
     df = pd.read_csv(source_path)
-    features = engineer_turkish_features(df)
+    features = engineer_turkish_features(df, target_horizon=args.target_horizon)
 
     if args.with_regime_weights:
         features = generate_regime_weights(

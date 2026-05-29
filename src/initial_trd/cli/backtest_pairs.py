@@ -7,6 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 from initial_trd.backtesting import (
+    DEFAULT_COINTEGRATION_PVALUE_THRESHOLD,
+    DEFAULT_MIN_COINTEGRATION_OBSERVATIONS,
+    DEFAULT_SLIPPAGE_PER_LEG,
+    DEFAULT_TRANSACTION_COST_PER_LEG,
     classify_backtest_regimes_by_date,
     resolve_device,
     select_common_trading_dates,
@@ -31,7 +35,7 @@ from initial_trd.training import engineer_turkish_features
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Backtest symmetric pair trades over the latest trading intervals."
+        description="Backtest hedge-adjusted pair trades over the latest trading intervals."
     )
     parser.add_argument(
         "--tickers",
@@ -73,11 +77,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated feature columns for the LSTM.",
     )
     parser.add_argument("--target", default="target")
+    parser.add_argument("--target-horizon", type=int, default=2)
     parser.add_argument("--weight-column", default="sample_weight")
     parser.add_argument("--sequence-length", type=int, default=30)
     parser.add_argument("--validation-size", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=66)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
@@ -93,6 +98,57 @@ def parse_args() -> argparse.Namespace:
         help="Absolute entry z-score threshold.",
     )
     parser.add_argument("--exit-z", type=float, default=0.5)
+    parser.add_argument(
+        "--transaction-cost-per-leg",
+        type=float,
+        default=DEFAULT_TRANSACTION_COST_PER_LEG,
+        help=(
+            "Per-leg tax/commission cost as a decimal. Defaults to 0.0010 "
+            "before slippage."
+        ),
+    )
+    parser.add_argument(
+        "--slippage-per-leg",
+        type=float,
+        default=DEFAULT_SLIPPAGE_PER_LEG,
+        help="Per-leg bid/ask or execution slippage as a decimal.",
+    )
+    parser.add_argument(
+        "--shortable-tickers",
+        default="",
+        help=(
+            "Comma-separated tickers with confirmed borrow availability. "
+            "When omitted, short entries are blocked unless --allow-unlisted-shorts is set."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unlisted-shorts",
+        action="store_true",
+        help="Research-only mode: allow shorts even when a ticker is not in --shortable-tickers.",
+    )
+    parser.add_argument(
+        "--disable-cointegration-filter",
+        action="store_true",
+        help="Research-only mode: allow opens without passing the Engle-Granger filter.",
+    )
+    parser.add_argument(
+        "--cointegration-pvalue-threshold",
+        type=float,
+        default=DEFAULT_COINTEGRATION_PVALUE_THRESHOLD,
+        help="Maximum Engle-Granger residual unit-root p-value proxy for opening a pair.",
+    )
+    parser.add_argument(
+        "--min-cointegration-observations",
+        type=int,
+        default=DEFAULT_MIN_COINTEGRATION_OBSERVATIONS,
+        help="Minimum historical observations required before a pair can open.",
+    )
+    parser.add_argument(
+        "--cointegration-lookback",
+        type=int,
+        default=None,
+        help="Optional trailing observation count for hedge-ratio and cointegration estimates.",
+    )
     parser.add_argument(
         "--output",
         default=None,
@@ -111,6 +167,11 @@ def main() -> None:
     tickers = _parse_tickers(args.tickers)
     if len(tickers) < 2:
         raise ValueError("at least two tickers are required")
+    shortable_tickers = (
+        _parse_tickers(args.shortable_tickers)
+        if args.shortable_tickers.strip()
+        else ()
+    )
 
     device = resolve_device(args.device)
     feature_columns = _parse_columns(args.features)
@@ -122,10 +183,34 @@ def main() -> None:
     print(f"Days: {args.days}")
     print(f"Device: {device}")
     print(f"Epochs per daily retrain: {args.epochs}")
+    print(f"Target horizon: {args.target_horizon}")
     print(f"Feature regime weights: {'yes' if use_regime_weights else 'no'}")
+    print(
+        "All-in cost per leg: "
+        f"{(args.transaction_cost_per_leg + args.slippage_per_leg) * 100.0:.3f}%"
+    )
+    print(
+        "Short availability: "
+        + (
+            ", ".join(shortable_tickers)
+            if shortable_tickers
+            else "none supplied; short entries blocked"
+            if not args.allow_unlisted_shorts
+            else "not enforced"
+        )
+    )
+    cointegration_text = (
+        "disabled"
+        if args.disable_cointegration_filter
+        else (
+            f"p<={args.cointegration_pvalue_threshold}, "
+            f"min_obs={args.min_cointegration_observations}"
+        )
+    )
+    print(f"Cointegration filter: {cointegration_text}")
     print()
 
-    print("Step 1/4: Fetching market data")
+    print("Step 1/5: Fetching market data")
     fetch_and_align_data(
         stock_a_ticker=tickers[0],
         stock_b_ticker=tickers[1],
@@ -143,18 +228,22 @@ def main() -> None:
     )
 
     print()
-    print("Step 2/4: Engineering features")
+    print("Step 2/5: Engineering features")
     raw_market_path = resolve_project_path(RAW_MARKET_PATH)
     raw_df = pd.read_csv(raw_market_path)
-    features_df = engineer_turkish_features(raw_df)
+    features_df = engineer_turkish_features(
+        raw_df,
+        target_horizon=args.target_horizon,
+    )
     print(f"Feature rows: {len(features_df)}")
 
     print()
     print("Step 3/5: Classifying daily HMM regimes")
-    test_dates = select_common_trading_dates(stock_closes, tickers, days=args.days)
+    test_dates = select_common_trading_dates(stock_closes, tickers, days=args.days + 1)
+    signal_dates = test_dates[:-2]
     regimes = classify_backtest_regimes_by_date(
         features_df,
-        test_dates[:-1],
+        signal_dates,
         random_state=args.hmm_random_state,
     )
     print(f"Regime classifications: {len(regimes)}")
@@ -163,7 +252,7 @@ def main() -> None:
     print("Step 4/5: Daily LSTM retraining")
     predictions = train_lstm_predictions_by_date(
         features_df,
-        test_dates[:-1],
+        signal_dates,
         feature_columns=feature_columns,
         target_column=args.target,
         weight_column=args.weight_column,
@@ -180,6 +269,7 @@ def main() -> None:
         device=device,
         use_regime_weights=use_regime_weights,
         hmm_random_state=args.hmm_random_state,
+        target_horizon=args.target_horizon,
     )
 
     print()
@@ -194,6 +284,14 @@ def main() -> None:
         window=args.window,
         entry_z=args.entry_z,
         exit_z=args.exit_z,
+        transaction_cost_per_leg=args.transaction_cost_per_leg,
+        slippage_per_leg=args.slippage_per_leg,
+        shortable_tickers=shortable_tickers,
+        require_short_availability=not args.allow_unlisted_shorts,
+        require_cointegration=not args.disable_cointegration_filter,
+        cointegration_pvalue_threshold=args.cointegration_pvalue_threshold,
+        min_cointegration_observations=args.min_cointegration_observations,
+        cointegration_lookback=args.cointegration_lookback,
     )
 
     output_path = resolve_project_path(args.output or _default_results_path(args.days))
@@ -220,7 +318,14 @@ def print_backtest_summary(summary: dict) -> None:
     print(f"Pairs tested: {summary['pairs_tested']}")
     print(f"Trades opened: {summary['trades_opened']}")
     print(f"Trades closed: {summary['trades_closed']}")
+    print(f"Blocked by short availability: {summary['trades_blocked_short']}")
+    print(f"Blocked by cointegration: {summary['trades_blocked_cointegration']}")
+    print(f"Forced closed at end: {summary['positions_forced_closed_end']}")
     print(f"Active pair-days: {summary['active_pair_days']}")
+    print(
+        "All-in per-leg cost: "
+        f"{summary['cost_model']['all_in_cost_per_leg'] * 100.0:.3f}%"
+    )
     print()
     for name, values in summary["account_values"].items():
         ending = values["ending_value"]

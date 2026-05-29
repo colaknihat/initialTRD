@@ -68,11 +68,14 @@ Create engineered features:
 trd-engineer-features
 ```
 
-Create engineered features with HMM sample weights:
+Create engineered features with precomputed HMM sample weights:
 
 ```powershell
 trd-engineer-features --with-regime-weights --random-state 7
 ```
+
+By default, `target` is the next trading period's BIST return minus USD/TRY
+return. Use `--target-horizon` to choose a farther horizon.
 
 Train the PyTorch LSTM:
 
@@ -85,7 +88,7 @@ trd-train-lstm --epochs 20 --device cuda
 Find the best epoch count by validation loss:
 
 ```powershell
-trd-tune-epochs --max-epochs 100 --patience 10 --device cuda
+trd-tune-epochs --max-epochs 100 --patience 50 --device cuda
 ```
 
 This writes `artifacts/epoch_tuning.csv` and `artifacts/epoch_tuning.json`.
@@ -94,10 +97,10 @@ Use the reported best epoch for the next `trd-train-lstm --epochs ...` run.
 Run the full default pipeline:
 
 ```powershell
-trd-run-pipeline --cds-csv data\turkey_5y_cds.csv --epochs 66 --device cuda
+trd-run-pipeline --cds-csv data\turkey_5y_cds.csv --epochs 25 --device cuda
 ```
 
-The pipeline runs fetch, weighted feature engineering, LSTM training,
+The pipeline runs fetch, feature engineering, split-safe weighted LSTM training,
 benchmark ridge walk-forward validation, and LSTM-based signal generation. The
 walk-forward metrics evaluate the configured benchmark model, not the saved
 LSTM that generates the signal. It writes `artifacts/pipeline_summary.json`
@@ -113,7 +116,7 @@ trd-run-pipeline `
   --stock-a-name ASELS `
   --stock-b-name THYAO `
   --cds-csv data\turkey_5y_cds.csv `
-  --epochs 66 `
+  --epochs 25 `
   --device cuda
 ```
 
@@ -143,6 +146,23 @@ Generate a pair-trade instruction from the saved LSTM:
 ```powershell
 trd-signal --device cpu
 ```
+
+Backtest pair signals with explicit execution constraints:
+
+```powershell
+trd-backtest-pairs `
+  --cds-csv data\turkey_5y_cds.csv `
+  --shortable-tickers THYAO.IS,PGSUS.IS `
+  --transaction-cost-per-leg 0.0010 `
+  --slippage-per-leg 0.0005
+```
+
+Pair backtests default to a conservative 0.15% all-in cost per executed leg
+and require confirmed short availability. If `--shortable-tickers` is omitted,
+short entries are blocked. Candidate pairs must also pass the historical
+Engle-Granger residual unit-root filter before an open is executed. Use
+`--allow-unlisted-shorts` or `--disable-cointegration-filter` only for
+research-only sensitivity checks.
 
 ## Public Imports
 
@@ -181,8 +201,9 @@ fx_volatility
 market_breadth
 ```
 
-`target` is BIST return minus USD/TRY return, so model performance is measured
-against holding dollars rather than nominal Turkish lira gains.
+`target` is the future BIST return minus the future USD/TRY return at the
+configured target horizon, so model performance is measured against holding
+dollars without exposing the same-row answer as a feature.
 
 The CDS CSV may be an Investing.com export with `Date` and `Price` columns, or
 a Bloomberg/Refinitiv export with `Date` plus `PX_LAST`, `Close`, or
@@ -190,6 +211,14 @@ a Bloomberg/Refinitiv export with `Date` plus `PX_LAST`, `Close`, or
 
 Pair-trade inputs can be pandas Series of close prices or dataframes with a
 `close` column.
+
+The pair backtester estimates hedge ratios from historical log prices available
+through each signal date, uses the hedge ratio for spread z-scores and leg
+weights, and reports both gross and net pair returns. Signals use data through
+the signal-date close, entries/exits fill on the next close, and PnL is measured
+from that execution close to the following close. Open positions at the end of
+the test window are charged exit costs on the final interval. Its cointegration
+p-value is an internal Engle-Granger-style approximation.
 
 ## Verification
 

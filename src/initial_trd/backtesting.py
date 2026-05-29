@@ -22,12 +22,46 @@ from initial_trd.training import (
 
 PredictionSource = Mapping[pd.Timestamp, float] | Callable[[pd.Timestamp], float]
 RegimeSource = int | Mapping[pd.Timestamp, int] | Callable[[pd.Timestamp], int]
+DEFAULT_TRANSACTION_COST_PER_LEG = 0.0010
+DEFAULT_SLIPPAGE_PER_LEG = 0.0005
+DEFAULT_COINTEGRATION_PVALUE_THRESHOLD = 0.05
+DEFAULT_MIN_COINTEGRATION_OBSERVATIONS = 60
 
 
 @dataclass(frozen=True)
 class PairBacktestResult:
     rows: pd.DataFrame
     summary: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PairRelationship:
+    hedge_ratio: float
+    intercept: float
+    t_stat: float
+    p_value: float
+    critical_value: float
+    is_cointegrated: bool
+    observations: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class PairPosition:
+    long_leg: str
+    short_leg: str
+    hedge_ratio: float
+
+
+@dataclass(frozen=True)
+class PairReturnComponents:
+    long_return: float
+    short_return: float
+    gross_pair_return: float
+    pair_return: float
+    trade_cost_return: float
+    long_weight: float
+    short_weight: float
 
 
 def generate_symmetric_pair_signal(
@@ -87,31 +121,65 @@ def simulate_pair_backtest(
     window: int = 30,
     entry_z: float = 2.0,
     exit_z: float = 0.5,
+    transaction_cost_per_leg: float = DEFAULT_TRANSACTION_COST_PER_LEG,
+    slippage_per_leg: float = DEFAULT_SLIPPAGE_PER_LEG,
+    shortable_tickers: Sequence[str] | None = None,
+    require_short_availability: bool = True,
+    require_cointegration: bool = True,
+    cointegration_pvalue_threshold: float = DEFAULT_COINTEGRATION_PVALUE_THRESHOLD,
+    min_cointegration_observations: int = DEFAULT_MIN_COINTEGRATION_OBSERVATIONS,
+    cointegration_lookback: int | None = None,
 ) -> PairBacktestResult:
-    """Simulate symmetric pair-trade signals over the latest close-to-close window."""
+    """Simulate hedge-adjusted pair trades over the latest close-to-close window."""
 
     ticker_list = list(tickers or closes.columns)
     if len(ticker_list) < 2:
         raise ValueError("at least two tickers are required")
+    _validate_backtest_execution_inputs(
+        transaction_cost_per_leg=transaction_cost_per_leg,
+        slippage_per_leg=slippage_per_leg,
+        cointegration_pvalue_threshold=cointegration_pvalue_threshold,
+        min_cointegration_observations=min_cointegration_observations,
+        cointegration_lookback=cointegration_lookback,
+    )
 
     normalized = _normalize_close_frame(closes, ticker_list)
-    test_dates = select_common_trading_dates(normalized, ticker_list, days=days)
+    test_dates = select_common_trading_dates(normalized, ticker_list, days=days + 1)
     common = normalized.loc[:, ticker_list].dropna()
     pairs = list(combinations(ticker_list, 2))
-    positions: dict[tuple[str, str], tuple[str, str] | None] = {
+    shortable = set(shortable_tickers or ())
+    positions: dict[tuple[str, str], PairPosition | None] = {
         pair: None for pair in pairs
     }
     rows: list[dict[str, Any]] = []
 
-    for signal_date, next_date in zip(test_dates[:-1], test_dates[1:]):
+    for signal_date, execution_date, next_date in zip(
+        test_dates[:-2],
+        test_dates[1:-1],
+        test_dates[2:],
+    ):
         predicted_return = _prediction_for_date(predictions, signal_date)
         regime_value = _regime_for_date(regime, signal_date)
 
         for stock_a, stock_b in pairs:
             pair_key = (stock_a, stock_b)
+            relationship = estimate_pair_relationship(
+                common.loc[:signal_date, [stock_a, stock_b]],
+                stock_a,
+                stock_b,
+                lookback=cointegration_lookback,
+                min_observations=min_cointegration_observations,
+                pvalue_threshold=cointegration_pvalue_threshold,
+            )
+            signal_hedge_ratio = (
+                relationship.hedge_ratio
+                if _is_positive_finite(relationship.hedge_ratio)
+                else 1.0
+            )
             instruction = generate_symmetric_pair_signal(
-                common.loc[:signal_date, stock_a],
-                common.loc[:signal_date, stock_b],
+                _log_close_series(common.loc[:signal_date, stock_a], stock_a),
+                signal_hedge_ratio
+                * _log_close_series(common.loc[:signal_date, stock_b], stock_b),
                 regime_value,
                 predicted_return,
                 window=window,
@@ -122,37 +190,95 @@ def simulate_pair_backtest(
             )
             previous_position = positions[pair_key]
             executed_action = "HOLD"
+            active_position = False
+            return_applied = False
+            position_long = None
+            position_short = None
+            position_hedge_ratio = float("nan")
+            long_return = 0.0
+            short_return = 0.0
+            gross_pair_return = 0.0
+            pair_return = 0.0
+            trade_cost_return = 0.0
+            long_weight = 0.0
+            short_weight = 0.0
+            forced_close_end = False
 
             if instruction.action == "CLOSE":
                 if previous_position is not None:
                     executed_action = "CLOSE"
+                    position_long = previous_position.long_leg
+                    position_short = previous_position.short_leg
+                    position_hedge_ratio = previous_position.hedge_ratio
+                    close_components = calculate_close_cost_components(
+                        long_leg=position_long,
+                        short_leg=position_short,
+                        stock_a=stock_a,
+                        stock_b=stock_b,
+                        hedge_ratio=position_hedge_ratio,
+                        transaction_cost_per_leg=transaction_cost_per_leg,
+                        slippage_per_leg=slippage_per_leg,
+                    )
+                    long_return = close_components.long_return
+                    short_return = close_components.short_return
+                    gross_pair_return = close_components.gross_pair_return
+                    pair_return = close_components.pair_return
+                    trade_cost_return = close_components.trade_cost_return
+                    long_weight = close_components.long_weight
+                    short_weight = close_components.short_weight
+                    return_applied = True
                 positions[pair_key] = None
             elif instruction.action == "OPEN_PAIR" and previous_position is None:
-                positions[pair_key] = (instruction.long_leg, instruction.short_leg)  # type: ignore[arg-type]
-                executed_action = "OPEN_PAIR"
+                short_leg = str(instruction.short_leg)
+                if require_short_availability and short_leg not in shortable:
+                    executed_action = "BLOCKED_SHORT_UNAVAILABLE"
+                elif require_cointegration and not relationship.is_cointegrated:
+                    executed_action = "BLOCKED_COINTEGRATION"
+                else:
+                    position_hedge_ratio = signal_hedge_ratio
+                    positions[pair_key] = PairPosition(
+                        long_leg=str(instruction.long_leg),
+                        short_leg=short_leg,
+                        hedge_ratio=position_hedge_ratio,
+                    )
+                    executed_action = "OPEN_PAIR"
 
             current_position = positions[pair_key]
-            if current_position is None:
-                long_return = 0.0
-                short_return = 0.0
-                pair_return = 0.0
-                position_long = None
-                position_short = None
-                active_position = False
-            else:
-                position_long, position_short = current_position
-                long_return, short_return, pair_return = calculate_pair_return(
+            if current_position is not None:
+                forced_close_end = bool(next_date == test_dates[-1])
+                position_long = current_position.long_leg
+                position_short = current_position.short_leg
+                position_hedge_ratio = current_position.hedge_ratio
+                interval_components = calculate_pair_return_components(
                     common,
-                    signal_date=signal_date,
+                    signal_date=execution_date,
                     next_date=next_date,
                     long_leg=position_long,
                     short_leg=position_short,
+                    stock_a=stock_a,
+                    stock_b=stock_b,
+                    hedge_ratio=position_hedge_ratio,
+                    transaction_cost_per_leg=transaction_cost_per_leg,
+                    slippage_per_leg=slippage_per_leg,
+                    charge_entry_cost=executed_action == "OPEN_PAIR",
+                    charge_exit_cost=forced_close_end,
                 )
+                long_return = interval_components.long_return
+                short_return = interval_components.short_return
+                gross_pair_return = interval_components.gross_pair_return
+                pair_return = interval_components.pair_return
+                trade_cost_return = interval_components.trade_cost_return
+                long_weight = interval_components.long_weight
+                short_weight = interval_components.short_weight
                 active_position = True
+                return_applied = True
+                if forced_close_end:
+                    positions[pair_key] = None
 
             rows.append(
                 {
                     "signal_date": _date_string(signal_date),
+                    "execution_date": _date_string(execution_date),
                     "next_date": _date_string(next_date),
                     "pair": f"{stock_a}/{stock_b}",
                     "stock_a": stock_a,
@@ -168,12 +294,27 @@ def simulate_pair_backtest(
                     "active_position": active_position,
                     "long_return": long_return,
                     "short_return": short_return,
+                    "gross_pair_return": gross_pair_return,
                     "pair_return": pair_return,
+                    "trade_cost_return": trade_cost_return,
+                    "long_weight": long_weight,
+                    "short_weight": short_weight,
+                    "hedge_ratio": position_hedge_ratio
+                    if _is_positive_finite(position_hedge_ratio)
+                    else relationship.hedge_ratio,
+                    "cointegration_pvalue": relationship.p_value,
+                    "cointegration_t_stat": relationship.t_stat,
+                    "cointegration_critical_value": relationship.critical_value,
+                    "cointegration_observations": relationship.observations,
+                    "cointegrated": relationship.is_cointegrated,
+                    "cointegration_reason": relationship.reason,
+                    "return_applied": return_applied,
+                    "forced_close_end": forced_close_end,
                     "gross_100_pnl": initial_capital * pair_return
-                    if active_position
+                    if return_applied
                     else 0.0,
                     "notional_200_pnl": initial_capital * 2.0 * pair_return
-                    if active_position
+                    if return_applied
                     else 0.0,
                 }
             )
@@ -185,6 +326,14 @@ def simulate_pair_backtest(
         days=days,
         pairs_tested=len(pairs),
         initial_capital=initial_capital,
+        transaction_cost_per_leg=transaction_cost_per_leg,
+        slippage_per_leg=slippage_per_leg,
+        require_short_availability=require_short_availability,
+        shortable_tickers=sorted(shortable),
+        require_cointegration=require_cointegration,
+        cointegration_pvalue_threshold=cointegration_pvalue_threshold,
+        min_cointegration_observations=min_cointegration_observations,
+        cointegration_lookback=cointegration_lookback,
     )
     return PairBacktestResult(rows=row_frame, summary=summary)
 
@@ -234,15 +383,110 @@ def classify_backtest_regimes_by_date(
     return regimes
 
 
-def calculate_pair_return(
+def estimate_pair_relationship(
+    closes: pd.DataFrame,
+    stock_a: str,
+    stock_b: str,
+    *,
+    lookback: int | None = None,
+    min_observations: int = DEFAULT_MIN_COINTEGRATION_OBSERVATIONS,
+    pvalue_threshold: float = DEFAULT_COINTEGRATION_PVALUE_THRESHOLD,
+) -> PairRelationship:
+    """Estimate a log-price hedge ratio and Engle-Granger cointegration status."""
+
+    _validate_cointegration_inputs(
+        pvalue_threshold=pvalue_threshold,
+        min_observations=min_observations,
+        lookback=lookback,
+    )
+    normalized = _normalize_close_frame(closes, [stock_a, stock_b])
+    pair_closes = normalized.loc[:, [stock_a, stock_b]].dropna()
+    if lookback is not None:
+        pair_closes = pair_closes.tail(lookback)
+
+    observations = int(len(pair_closes))
+    invalid = _invalid_relationship(
+        observations=observations,
+        min_observations=min_observations,
+        pvalue_threshold=pvalue_threshold,
+        reason=f"at least {min_observations} observations are required",
+    )
+    if observations < min_observations:
+        return invalid
+    if (pair_closes <= 0.0).any().any():
+        return _invalid_relationship(
+            observations=observations,
+            min_observations=min_observations,
+            pvalue_threshold=pvalue_threshold,
+            reason="close prices must be positive for log-price cointegration",
+        )
+
+    log_a = np.log(pair_closes[stock_a].to_numpy(dtype=float))
+    log_b = np.log(pair_closes[stock_b].to_numpy(dtype=float))
+    if np.isclose(float(np.var(log_b)), 0.0):
+        return _invalid_relationship(
+            observations=observations,
+            min_observations=min_observations,
+            pvalue_threshold=pvalue_threshold,
+            reason=f"{stock_b} log prices have no variance",
+        )
+
+    design = np.column_stack([np.ones_like(log_b), log_b])
+    intercept, hedge_ratio = np.linalg.lstsq(design, log_a, rcond=None)[0]
+    if not _is_positive_finite(float(hedge_ratio)):
+        return _invalid_relationship(
+            observations=observations,
+            min_observations=min_observations,
+            pvalue_threshold=pvalue_threshold,
+            reason="estimated hedge ratio is not positive and finite",
+            intercept=float(intercept),
+            hedge_ratio=float(hedge_ratio),
+        )
+
+    residual = log_a - float(intercept) - float(hedge_ratio) * log_b
+    t_stat, p_value, critical_value, reason = _engle_granger_residual_test(
+        residual,
+        pvalue_threshold=pvalue_threshold,
+    )
+    is_cointegrated = bool(np.isfinite(t_stat) and t_stat <= critical_value)
+    if is_cointegrated:
+        reason = "cointegration accepted"
+
+    return PairRelationship(
+        hedge_ratio=float(hedge_ratio),
+        intercept=float(intercept),
+        t_stat=float(t_stat),
+        p_value=float(p_value),
+        critical_value=float(critical_value),
+        is_cointegrated=is_cointegrated,
+        observations=observations,
+        reason=reason,
+    )
+
+
+def calculate_pair_return_components(
     closes: pd.DataFrame,
     *,
     signal_date: pd.Timestamp,
     next_date: pd.Timestamp,
     long_leg: str,
     short_leg: str,
-) -> tuple[float, float, float]:
-    """Return long, short, and gross-balanced pair returns for one interval."""
+    stock_a: str | None = None,
+    stock_b: str | None = None,
+    hedge_ratio: float = 1.0,
+    transaction_cost_per_leg: float = 0.0,
+    slippage_per_leg: float = 0.0,
+    charge_entry_cost: bool = False,
+    charge_exit_cost: bool = False,
+) -> PairReturnComponents:
+    """Return hedge-weighted pair-return details for one close-to-close interval."""
+
+    if not _is_positive_finite(hedge_ratio):
+        raise ValueError("hedge_ratio must be positive and finite")
+    if transaction_cost_per_leg < 0.0:
+        raise ValueError("transaction_cost_per_leg cannot be negative")
+    if slippage_per_leg < 0.0:
+        raise ValueError("slippage_per_leg cannot be negative")
 
     current_long = float(closes.loc[signal_date, long_leg])
     next_long = float(closes.loc[next_date, long_leg])
@@ -251,10 +495,111 @@ def calculate_pair_return(
     if current_long <= 0.0 or current_short <= 0.0:
         raise ValueError("close prices must be positive to calculate returns")
 
+    long_weight, short_weight = _hedge_weights(
+        long_leg=long_leg,
+        short_leg=short_leg,
+        hedge_ratio=hedge_ratio,
+        stock_a=stock_a,
+        stock_b=stock_b,
+    )
     long_return = next_long / current_long - 1.0
     short_return = -(next_short / current_short - 1.0)
-    pair_return = 0.5 * long_return + 0.5 * short_return
-    return float(long_return), float(short_return), float(pair_return)
+    gross_pair_return = long_weight * long_return + short_weight * short_return
+    trade_cost_return = _trade_cost_return(
+        long_weight=long_weight,
+        short_weight=short_weight,
+        transaction_cost_per_leg=transaction_cost_per_leg,
+        slippage_per_leg=slippage_per_leg,
+        charge_entry_cost=charge_entry_cost,
+        charge_exit_cost=charge_exit_cost,
+    )
+    pair_return = gross_pair_return - trade_cost_return
+    return PairReturnComponents(
+        long_return=float(long_return),
+        short_return=float(short_return),
+        gross_pair_return=float(gross_pair_return),
+        pair_return=float(pair_return),
+        trade_cost_return=float(trade_cost_return),
+        long_weight=float(long_weight),
+        short_weight=float(short_weight),
+    )
+
+
+def calculate_close_cost_components(
+    *,
+    long_leg: str,
+    short_leg: str,
+    stock_a: str,
+    stock_b: str,
+    hedge_ratio: float,
+    transaction_cost_per_leg: float,
+    slippage_per_leg: float,
+) -> PairReturnComponents:
+    """Return exit-cost-only components for a position closed at the signal date."""
+
+    long_weight, short_weight = _hedge_weights(
+        long_leg=long_leg,
+        short_leg=short_leg,
+        hedge_ratio=hedge_ratio,
+        stock_a=stock_a,
+        stock_b=stock_b,
+    )
+    trade_cost_return = _trade_cost_return(
+        long_weight=long_weight,
+        short_weight=short_weight,
+        transaction_cost_per_leg=transaction_cost_per_leg,
+        slippage_per_leg=slippage_per_leg,
+        charge_entry_cost=False,
+        charge_exit_cost=True,
+    )
+    return PairReturnComponents(
+        long_return=0.0,
+        short_return=0.0,
+        gross_pair_return=0.0,
+        pair_return=float(-trade_cost_return),
+        trade_cost_return=float(trade_cost_return),
+        long_weight=float(long_weight),
+        short_weight=float(short_weight),
+    )
+
+
+def calculate_pair_return(
+    closes: pd.DataFrame,
+    *,
+    signal_date: pd.Timestamp,
+    next_date: pd.Timestamp,
+    long_leg: str,
+    short_leg: str,
+    stock_a: str | None = None,
+    stock_b: str | None = None,
+    hedge_ratio: float = 1.0,
+    transaction_cost_per_leg: float = 0.0,
+    slippage_per_leg: float = 0.0,
+    charge_entry_cost: bool = False,
+    charge_exit_cost: bool = False,
+) -> tuple[float, float, float]:
+    """Return long, short, and net hedge-weighted pair returns for one interval."""
+
+    components = calculate_pair_return_components(
+        closes,
+        signal_date=signal_date,
+        next_date=next_date,
+        long_leg=long_leg,
+        short_leg=short_leg,
+        stock_a=stock_a,
+        stock_b=stock_b,
+        hedge_ratio=hedge_ratio,
+        transaction_cost_per_leg=transaction_cost_per_leg,
+        slippage_per_leg=slippage_per_leg,
+        charge_entry_cost=charge_entry_cost,
+        charge_exit_cost=charge_exit_cost,
+    )
+    return (
+        components.long_return,
+        components.short_return,
+        components.pair_return,
+    )
+
 
 
 def calculate_backtest_account_values(
@@ -274,17 +619,17 @@ def calculate_backtest_account_values(
             )
         }
 
-    active = rows.loc[rows["active_position"].astype(bool)]
+    pnl_rows = rows.loc[_return_applied_mask(rows)]
     portfolio_value = float(initial_capital)
     for _, day_rows in rows.groupby("signal_date", sort=True):
-        active_day = day_rows.loc[day_rows["active_position"].astype(bool)]
+        active_day = day_rows.loc[_return_applied_mask(day_rows)]
         daily_return = (
             float(active_day["pair_return"].mean()) if not active_day.empty else 0.0
         )
         portfolio_value *= 1.0 + daily_return
 
-    gross_ending = initial_capital + float(active["gross_100_pnl"].sum())
-    notional_ending = initial_capital + float(active["notional_200_pnl"].sum())
+    gross_ending = initial_capital + float(pnl_rows["gross_100_pnl"].sum())
+    notional_ending = initial_capital + float(pnl_rows["notional_200_pnl"].sum())
 
     return {
         "portfolio_100": _account_values(initial_capital, portfolio_value),
@@ -300,6 +645,14 @@ def build_backtest_summary(
     days: int,
     pairs_tested: int,
     initial_capital: float,
+    transaction_cost_per_leg: float = 0.0,
+    slippage_per_leg: float = 0.0,
+    require_short_availability: bool = False,
+    shortable_tickers: Sequence[str] | None = None,
+    require_cointegration: bool = False,
+    cointegration_pvalue_threshold: float = DEFAULT_COINTEGRATION_PVALUE_THRESHOLD,
+    min_cointegration_observations: int = DEFAULT_MIN_COINTEGRATION_OBSERVATIONS,
+    cointegration_lookback: int | None = None,
 ) -> dict[str, Any]:
     account_values = calculate_backtest_account_values(
         rows,
@@ -325,8 +678,46 @@ def build_backtest_summary(
         "trades_closed": int((rows["executed_action"] == "CLOSE").sum())
         if not rows.empty
         else 0,
+        "trades_blocked_short": int(
+            (rows["executed_action"] == "BLOCKED_SHORT_UNAVAILABLE").sum()
+        )
+        if not rows.empty
+        else 0,
+        "trades_blocked_cointegration": int(
+            (rows["executed_action"] == "BLOCKED_COINTEGRATION").sum()
+        )
+        if not rows.empty
+        else 0,
+        "positions_forced_closed_end": int(rows["forced_close_end"].sum())
+        if not rows.empty and "forced_close_end" in rows.columns
+        else 0,
         "active_pair_days": int(len(active)),
         "max_active_pairs": int(active_counts.max()) if not active_counts.empty else 0,
+        "cost_model": {
+            "transaction_cost_per_leg": float(transaction_cost_per_leg),
+            "slippage_per_leg": float(slippage_per_leg),
+            "all_in_cost_per_leg": float(
+                transaction_cost_per_leg + slippage_per_leg
+            ),
+            "round_trip_cost_gross_100": float(
+                2.0 * (transaction_cost_per_leg + slippage_per_leg)
+            ),
+            "round_trip_cost_notional_200": float(
+                4.0 * (transaction_cost_per_leg + slippage_per_leg)
+            ),
+        },
+        "short_selling": {
+            "required": bool(require_short_availability),
+            "shortable_tickers": list(shortable_tickers or []),
+        },
+        "cointegration_filter": {
+            "required": bool(require_cointegration),
+            "pvalue_threshold": float(cointegration_pvalue_threshold),
+            "min_observations": int(min_cointegration_observations),
+            "lookback": None
+            if cointegration_lookback is None
+            else int(cointegration_lookback),
+        },
         "account_values": account_values,
     }
 
@@ -351,6 +742,7 @@ def train_lstm_predictions_by_date(
     device: str,
     use_regime_weights: bool,
     hmm_random_state: int | None,
+    target_horizon: int = 1,
     verbose: bool = True,
 ) -> dict[pd.Timestamp, float]:
     predictions: dict[pd.Timestamp, float] = {}
@@ -377,6 +769,7 @@ def train_lstm_predictions_by_date(
             device=device,
             use_regime_weights=use_regime_weights,
             hmm_random_state=hmm_random_state,
+            target_horizon=target_horizon,
         )
     return predictions
 
@@ -401,7 +794,10 @@ def train_lstm_prediction_for_date(
     device: str,
     use_regime_weights: bool,
     hmm_random_state: int | None,
+    target_horizon: int = 1,
 ) -> float:
+    if target_horizon < 1:
+        raise ValueError("target_horizon must be at least 1")
     if "date" not in features_df.columns:
         raise ValueError("features_df must include a date column")
 
@@ -410,8 +806,6 @@ def train_lstm_prediction_for_date(
     history = history.loc[history["date"] <= signal_date].copy()
     if history.empty:
         raise ValueError(f"no feature rows are available through {_date_string(signal_date)}")
-    if use_regime_weights:
-        history = generate_regime_weights(history, random_state=hmm_random_state)
 
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -419,7 +813,7 @@ def train_lstm_prediction_for_date(
     np.random.seed(seed)
 
     x, y, weights = build_sequence_arrays(
-        history,
+        _drop_unrevealed_target_rows(history, target_horizon=target_horizon),
         feature_columns=list(feature_columns),
         target_column=target_column,
         weight_column=weight_column,
@@ -431,6 +825,9 @@ def train_lstm_prediction_for_date(
         weights,
         validation_size=validation_size,
         batch_size=batch_size,
+        feature_columns=feature_columns,
+        use_regime_weights=use_regime_weights,
+        hmm_random_state=hmm_random_state,
     )
     model = BISTResilientLSTM(
         input_dim=len(feature_columns),
@@ -476,6 +873,208 @@ def resolve_device(value: str | None) -> str:
     if value == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False")
     return value
+
+
+def _drop_unrevealed_target_rows(
+    history: pd.DataFrame,
+    *,
+    target_horizon: int,
+) -> pd.DataFrame:
+    if len(history) <= target_horizon:
+        raise ValueError("not enough feature rows have revealed targets")
+    return history.iloc[:-target_horizon].copy()
+
+
+def _validate_backtest_execution_inputs(
+    *,
+    transaction_cost_per_leg: float,
+    slippage_per_leg: float,
+    cointegration_pvalue_threshold: float,
+    min_cointegration_observations: int,
+    cointegration_lookback: int | None,
+) -> None:
+    if transaction_cost_per_leg < 0.0:
+        raise ValueError("transaction_cost_per_leg cannot be negative")
+    if slippage_per_leg < 0.0:
+        raise ValueError("slippage_per_leg cannot be negative")
+    _validate_cointegration_inputs(
+        pvalue_threshold=cointegration_pvalue_threshold,
+        min_observations=min_cointegration_observations,
+        lookback=cointegration_lookback,
+    )
+
+
+def _validate_cointegration_inputs(
+    *,
+    pvalue_threshold: float,
+    min_observations: int,
+    lookback: int | None,
+) -> None:
+    if not 0.0 < pvalue_threshold < 1.0:
+        raise ValueError("cointegration p-value threshold must be between 0 and 1")
+    if min_observations < 4:
+        raise ValueError("min_cointegration_observations must be at least 4")
+    if lookback is not None and lookback < min_observations:
+        raise ValueError("cointegration_lookback must be at least min_observations")
+
+
+def _invalid_relationship(
+    *,
+    observations: int,
+    min_observations: int,
+    pvalue_threshold: float,
+    reason: str,
+    intercept: float = float("nan"),
+    hedge_ratio: float = float("nan"),
+) -> PairRelationship:
+    del min_observations
+    critical_value = _critical_value_for_threshold(pvalue_threshold)
+    return PairRelationship(
+        hedge_ratio=float(hedge_ratio),
+        intercept=float(intercept),
+        t_stat=float("nan"),
+        p_value=1.0,
+        critical_value=critical_value,
+        is_cointegrated=False,
+        observations=int(observations),
+        reason=reason,
+    )
+
+
+def _engle_granger_residual_test(
+    residual: np.ndarray,
+    *,
+    pvalue_threshold: float,
+) -> tuple[float, float, float, str]:
+    return _fallback_residual_adf_test(
+        residual,
+        pvalue_threshold=pvalue_threshold,
+    )
+
+
+def _fallback_residual_adf_test(
+    residual: np.ndarray,
+    *,
+    pvalue_threshold: float,
+) -> tuple[float, float, float, str]:
+    values = np.asarray(residual, dtype=float).reshape(-1)
+    critical_value = _critical_value_for_threshold(pvalue_threshold)
+    if len(values) < 4:
+        return float("nan"), 1.0, critical_value, "not enough residual observations"
+    if not np.isfinite(values).all():
+        return float("nan"), 1.0, critical_value, "residuals are not finite"
+
+    lagged = values[:-1]
+    delta = np.diff(values)
+    if np.isclose(float(np.var(lagged)), 0.0):
+        return float("nan"), 1.0, critical_value, "residuals have no variance"
+
+    design = np.column_stack([np.ones_like(lagged), lagged])
+    coefficients = np.linalg.lstsq(design, delta, rcond=None)[0]
+    errors = delta - design @ coefficients
+    dof = len(delta) - design.shape[1]
+    if dof <= 0:
+        return float("nan"), 1.0, critical_value, "not enough degrees of freedom"
+
+    xtx_inv = np.linalg.pinv(design.T @ design)
+    residual_variance = float((errors @ errors) / dof)
+    gamma_variance = float(residual_variance * xtx_inv[1, 1])
+    if gamma_variance <= 0.0:
+        return float("nan"), 1.0, critical_value, "ADF coefficient variance is zero"
+
+    t_stat = float(coefficients[1] / np.sqrt(gamma_variance))
+    p_value = _approximate_cointegration_pvalue(t_stat)
+    if t_stat <= critical_value:
+        return t_stat, p_value, critical_value, "cointegration accepted"
+    return (
+        t_stat,
+        p_value,
+        critical_value,
+        "residual unit-root test does not reject non-cointegration",
+    )
+
+
+def _critical_value_for_threshold(pvalue_threshold: float) -> float:
+    if pvalue_threshold <= 0.01:
+        return -3.96
+    if pvalue_threshold <= 0.05:
+        return -3.37
+    if pvalue_threshold <= 0.10:
+        return -3.07
+    return -2.86
+
+
+def _approximate_cointegration_pvalue(t_stat: float) -> float:
+    if not np.isfinite(t_stat):
+        return 1.0
+    if t_stat <= -3.96:
+        return 0.01
+    if t_stat <= -3.37:
+        return 0.05
+    if t_stat <= -3.07:
+        return 0.10
+    if t_stat <= -2.86:
+        return 0.15
+    return 0.50
+
+
+def _log_close_series(series: pd.Series, name: str) -> pd.Series:
+    values = pd.Series(series, dtype=float)
+    if (values <= 0.0).any():
+        raise ValueError(f"{name} close prices must be positive")
+    return np.log(values)
+
+
+def _hedge_weights(
+    *,
+    long_leg: str,
+    short_leg: str,
+    hedge_ratio: float,
+    stock_a: str | None = None,
+    stock_b: str | None = None,
+) -> tuple[float, float]:
+    if not _is_positive_finite(hedge_ratio):
+        raise ValueError("hedge_ratio must be positive and finite")
+
+    denominator = 1.0 + float(hedge_ratio)
+    if stock_a is None or stock_b is None:
+        return 1.0 / denominator, float(hedge_ratio) / denominator
+    if long_leg == stock_a and short_leg == stock_b:
+        return 1.0 / denominator, float(hedge_ratio) / denominator
+    if long_leg == stock_b and short_leg == stock_a:
+        return float(hedge_ratio) / denominator, 1.0 / denominator
+    raise ValueError("long_leg and short_leg must match stock_a/stock_b")
+
+
+def _trade_cost_return(
+    *,
+    long_weight: float,
+    short_weight: float,
+    transaction_cost_per_leg: float,
+    slippage_per_leg: float,
+    charge_entry_cost: bool,
+    charge_exit_cost: bool,
+) -> float:
+    if transaction_cost_per_leg < 0.0:
+        raise ValueError("transaction_cost_per_leg cannot be negative")
+    if slippage_per_leg < 0.0:
+        raise ValueError("slippage_per_leg cannot be negative")
+
+    turnover_count = int(charge_entry_cost) + int(charge_exit_cost)
+    if turnover_count == 0:
+        return 0.0
+    all_in_cost = transaction_cost_per_leg + slippage_per_leg
+    return float(turnover_count * all_in_cost * (abs(long_weight) + abs(short_weight)))
+
+
+def _return_applied_mask(rows: pd.DataFrame) -> pd.Series:
+    if "return_applied" in rows.columns:
+        return rows["return_applied"].astype(bool)
+    return rows["active_position"].astype(bool)
+
+
+def _is_positive_finite(value: float) -> bool:
+    return bool(np.isfinite(value) and value > 0.0)
 
 
 def _normalize_close_frame(

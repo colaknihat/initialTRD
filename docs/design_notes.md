@@ -14,15 +14,21 @@ duplicate pseudocode beside the implementation.
 - Open a pair trade only when the current spread z-score and macro regime agree
   with the prediction.
 - Close positions when the spread mean-reverts toward the exit threshold.
+- In backtests, require a historically cointegrated pair, use a regression
+  hedge ratio for the spread and leg weights, and subtract explicit per-leg
+  execution costs before reporting returns.
+- With close-only data, generate signals from the signal-date close, execute on
+  the next close, and measure pair returns over the following close-to-close
+  interval.
 
 ## Training Intent
 
 - Engineer Turkey-specific macro features from BIST 100, USD/TRY, CBRT rate,
   CPI, CDS spread, and market breadth inputs.
-- Use FX-adjusted return as the target so the model is measured against holding
-  USD/TRY, not only nominal lira gains.
+- Use future FX-adjusted return as the target so the model is measured against
+  holding USD/TRY without leaking same-row returns into evaluation.
 - Use an HMM over return and volatility features to assign inverse-frequency
-  regime weights.
+  regime weights, fitting those weights only on chronological training rows.
 - Train an attention-based PyTorch LSTM with Huber loss, sample weights,
   AdamW, validation, learning-rate scheduling, and gradient clipping.
 

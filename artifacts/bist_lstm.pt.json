@@ -9,14 +9,12 @@
   ],
   "target": "target",
   "sequence_length": 30,
-  "rows_used": 3054,
-  "epochs": 30,
+  "rows_used": 2764,
+  "epochs": 25,
   "final_metrics": {
-    "epoch": 30.0,
-    "train_loss": 0.00011691491027915701,
-    "val_loss": 6.909982204885388e-05,
-    "learning_rate": 1e-05
-  },
-  "stock_a_ticker": "THYAO.IS",
-  "stock_b_ticker": "PGSUS.IS"
+    "epoch": 25.0,
+    "train_loss": 0.00019960931846184327,
+    "val_loss": 0.0001323597921352416,
+    "learning_rate": 0.0001
+  }
 }

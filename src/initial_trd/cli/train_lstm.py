@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -15,7 +16,11 @@ from initial_trd.paths import (
     first_existing_path,
     resolve_project_path,
 )
-from initial_trd.training import BISTResilientLSTM, train_bist_model
+from initial_trd.training import (
+    BISTResilientLSTM,
+    calculate_split_safe_regime_weights,
+    train_bist_model,
+)
 
 
 DEFAULT_FEATURES = (
@@ -37,8 +42,8 @@ def parse_args() -> argparse.Namespace:
         "--input",
         default=None,
         help=(
-            "Engineered input CSV path. Defaults to artifacts/features_weighted.csv "
-            "if it exists, otherwise artifacts/features.csv."
+            "Engineered input CSV path. Defaults to artifacts/features.csv "
+            "if it exists, otherwise artifacts/features_weighted.csv."
         ),
     )
     parser.add_argument(
@@ -79,7 +84,7 @@ def main() -> None:
     input_path = (
         resolve_project_path(args.input)
         if args.input
-        else first_existing_path(WEIGHTED_FEATURES_PATH, FEATURES_PATH)
+        else first_existing_path(FEATURES_PATH, WEIGHTED_FEATURES_PATH)
     )
     output_path = resolve_project_path(args.output)
     feature_columns = _parse_columns(args.features)
@@ -195,9 +200,9 @@ def build_sequence_arrays(
         targets = segment.loc[:, target_column].to_numpy(dtype=np.float32)
         weights = segment.loc[:, weight_column].to_numpy(dtype=np.float32)
 
-        for end in range(sequence_length, len(segment)):
-            start = end - sequence_length
-            x_rows.append(feature_values[start:end])
+        for end in range(sequence_length - 1, len(segment)):
+            start = end - sequence_length + 1
+            x_rows.append(feature_values[start : end + 1])
             y_rows.append(targets[end])
             weight_rows.append(weights[end])
 
@@ -233,6 +238,10 @@ def build_loaders(
     *,
     validation_size: float,
     batch_size: int,
+    feature_columns: Sequence[str] | None = None,
+    use_regime_weights: bool = False,
+    regime_model: Any = None,
+    hmm_random_state: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     if not 0.0 < validation_size < 1.0:
         raise ValueError("validation_size must be between 0 and 1")
@@ -243,21 +252,61 @@ def build_loaders(
     if split_index <= 0 or split_index >= len(x):
         raise ValueError("validation_size leaves an empty train or validation split")
 
+    effective_weights = np.asarray(weights, dtype=np.float32)
+    if use_regime_weights:
+        effective_weights = _split_safe_regime_weights(
+            x,
+            split_index=split_index,
+            feature_columns=feature_columns,
+            model=regime_model,
+            random_state=hmm_random_state,
+        )
+
     train_dataset = TensorDataset(
         torch.from_numpy(x[:split_index]),
         torch.from_numpy(y[:split_index]),
-        torch.from_numpy(weights[:split_index]),
+        torch.from_numpy(effective_weights[:split_index]),
     )
     val_dataset = TensorDataset(
         torch.from_numpy(x[split_index:]),
         torch.from_numpy(y[split_index:]),
-        torch.from_numpy(weights[split_index:]),
+        torch.from_numpy(effective_weights[split_index:]),
     )
 
     return (
         DataLoader(train_dataset, batch_size=batch_size, shuffle=False),
         DataLoader(val_dataset, batch_size=batch_size, shuffle=False),
     )
+
+
+def _split_safe_regime_weights(
+    x: np.ndarray,
+    *,
+    split_index: int,
+    feature_columns: Sequence[str] | None,
+    model: Any,
+    random_state: int | None,
+) -> np.ndarray:
+    if feature_columns is None:
+        raise ValueError("feature_columns are required for split-safe regime weights")
+
+    columns = list(feature_columns)
+    try:
+        bist_index = columns.index("bist_ret")
+        volatility_index = columns.index("fx_volatility")
+    except ValueError as exc:
+        raise ValueError(
+            "split-safe regime weights require bist_ret and fx_volatility features"
+        ) from exc
+
+    regime_values = x[:, -1, [bist_index, volatility_index]]
+    _, sample_weights = calculate_split_safe_regime_weights(
+        regime_values[:split_index],
+        regime_values,
+        model=model,
+        random_state=random_state,
+    )
+    return np.asarray(sample_weights, dtype=np.float32)
 
 
 def _parse_columns(value: str) -> list[str]:

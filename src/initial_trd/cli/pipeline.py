@@ -34,14 +34,12 @@ from initial_trd.paths import (
     STOCK_B_PATH,
     STRATEGY_SIGNAL_PATH,
     WALK_FORWARD_RESULTS_PATH,
-    WEIGHTED_FEATURES_PATH,
     resolve_project_path,
 )
 from initial_trd.strategy import execute_pairs_trade
 from initial_trd.training import (
     BISTResilientLSTM,
     engineer_turkish_features,
-    generate_regime_weights,
     train_bist_model,
 )
 
@@ -103,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-regime-weights",
         action="store_true",
-        help="Write artifacts/features.csv instead of weighted features.",
+        help="Train without split-safe HMM sample weights.",
     )
     parser.add_argument(
         "--features",
@@ -111,11 +109,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated feature columns for the LSTM and benchmark walk-forward tests.",
     )
     parser.add_argument("--target", default="target")
+    parser.add_argument("--target-horizon", type=int, default=1)
     parser.add_argument("--weight-column", default="sample_weight")
     parser.add_argument("--sequence-length", type=int, default=30)
     parser.add_argument("--validation-size", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=66)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.3)
@@ -179,16 +178,12 @@ def main() -> None:
     print()
     print("Step 2/5: Engineering features")
     raw_market_path = resolve_project_path(RAW_MARKET_PATH)
-    features_path = resolve_project_path(
-        WEIGHTED_FEATURES_PATH if use_regime_weights else FEATURES_PATH
-    )
+    features_path = resolve_project_path(FEATURES_PATH)
     raw_df = pd.read_csv(raw_market_path)
-    features_df = engineer_turkish_features(raw_df)
-    if use_regime_weights:
-        features_df = generate_regime_weights(
-            features_df,
-            random_state=args.hmm_random_state,
-        )
+    features_df = engineer_turkish_features(
+        raw_df,
+        target_horizon=args.target_horizon,
+    )
     features_path.parent.mkdir(parents=True, exist_ok=True)
     features_df.to_csv(features_path, index=False)
     print(f"Wrote {len(features_df)} rows to {features_path}")
@@ -209,6 +204,9 @@ def main() -> None:
         weights,
         validation_size=args.validation_size,
         batch_size=args.batch_size,
+        feature_columns=feature_columns,
+        use_regime_weights=use_regime_weights,
+        hmm_random_state=args.hmm_random_state,
     )
     model = BISTResilientLSTM(
         input_dim=len(feature_columns),
@@ -231,6 +229,7 @@ def main() -> None:
             "model_state_dict": model.state_dict(),
             "features": feature_columns,
             "target": args.target,
+            "target_horizon": args.target_horizon,
             "sequence_length": args.sequence_length,
             "hidden_dim": args.hidden_dim,
             "num_layers": args.num_layers,
@@ -247,6 +246,7 @@ def main() -> None:
             {
                 "features": feature_columns,
                 "target": args.target,
+                "target_horizon": args.target_horizon,
                 "sequence_length": args.sequence_length,
                 "rows_used": int(len(x)),
                 "epochs": args.epochs,
@@ -334,6 +334,7 @@ def main() -> None:
         "epochs": args.epochs,
         "device": args.device,
         "hmm_random_state": args.hmm_random_state,
+        "target_horizon": args.target_horizon,
         "features_path": str(features_path),
         "model_path": str(model_path),
         "walk_forward_results_path": str(walk_forward_path),

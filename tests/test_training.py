@@ -53,12 +53,28 @@ class TrainModelTests(unittest.TestCase):
         self.assertEqual(len(result), 7)
         self.assertNotIn("target", source.columns)
         row_index = result.index[0]
+        next_index = row_index + 1
         expected_target = (
+            source.loc[next_index, "BIST100"] / source.loc[next_index - 1, "BIST100"]
+            - 1.0
+            - (
+                source.loc[next_index, "USD_TRY"]
+                / source.loc[next_index - 1, "USD_TRY"]
+                - 1.0
+            )
+        )
+        same_row_target = (
             source.loc[row_index, "BIST100"] / source.loc[row_index - 1, "BIST100"]
             - 1.0
-            - (source.loc[row_index, "USD_TRY"] / source.loc[row_index - 1, "USD_TRY"] - 1.0)
+            - (
+                source.loc[row_index, "USD_TRY"]
+                / source.loc[row_index - 1, "USD_TRY"]
+                - 1.0
+            )
         )
         self.assertAlmostEqual(result.loc[row_index, "target"], expected_target)
+        self.assertNotAlmostEqual(result.loc[row_index, "target"], same_row_target)
+        self.assertTrue(pd.isna(result["target"].iloc[-1]))
         self.assertAlmostEqual(
             result.loc[row_index, "real_rate"],
             source.loc[row_index, "CBRT_Rate"] - source.loc[row_index, "CPI"],

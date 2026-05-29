@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from initial_trd.regimes import map_hmm_states_to_regimes
+from initial_trd.regimes import Regime, map_hmm_states_to_regimes
 
 
 REQUIRED_FEATURE_INPUT_COLUMNS = (
@@ -24,15 +24,23 @@ REQUIRED_FEATURE_INPUT_COLUMNS = (
 )
 
 
-def engineer_turkish_features(df: pd.DataFrame) -> pd.DataFrame:
+def engineer_turkish_features(
+    df: pd.DataFrame,
+    *,
+    target_horizon: int = 1,
+) -> pd.DataFrame:
     """Create Turkish macro and market features for model training."""
+
+    if target_horizon < 1:
+        raise ValueError("target_horizon must be at least 1")
 
     _require_columns(df, REQUIRED_FEATURE_INPUT_COLUMNS)
     features = df.copy()
 
     features["bist_ret"] = features["BIST100"].pct_change()
     features["fx_ret"] = features["USD_TRY"].pct_change()
-    features["target"] = features["bist_ret"] - features["fx_ret"]
+    relative_return = features["bist_ret"] - features["fx_ret"]
+    features["target"] = relative_return.shift(-target_horizon)
     features["real_rate"] = features["CBRT_Rate"] - features["CPI"]
     features["cds_velocity"] = features["5Y_CDS_Spread"].diff()
     features["fx_volatility"] = features["USD_TRY"].rolling(14).std()
@@ -41,7 +49,8 @@ def engineer_turkish_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     features = features.replace([np.inf, -np.inf], np.nan)
-    return features.dropna()
+    feature_columns = [column for column in features.columns if column != "target"]
+    return features.dropna(subset=feature_columns)
 
 
 def generate_regime_weights(
@@ -58,8 +67,36 @@ def generate_regime_weights(
     _require_columns(df, ("bist_ret", "fx_volatility"))
     weighted = df.copy()
     x_hmm = weighted[["bist_ret", "fx_volatility"]].to_numpy(dtype=float)
-    if len(x_hmm) == 0:
-        raise ValueError("df must contain at least one row")
+    regimes, sample_weights = calculate_split_safe_regime_weights(
+        x_hmm,
+        x_hmm,
+        model=model,
+        n_components=n_components,
+        covariance_type=covariance_type,
+        n_iter=n_iter,
+        random_state=random_state,
+    )
+
+    weighted["regime"] = regimes
+    weighted["sample_weight"] = sample_weights
+
+    return weighted
+
+
+def calculate_split_safe_regime_weights(
+    train_values: Any,
+    values: Any,
+    model: Optional[Any] = None,
+    *,
+    n_components: int = 4,
+    covariance_type: str = "diag",
+    n_iter: int = 200,
+    random_state: Optional[int] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit HMM regimes on training rows and apply train-derived weights."""
+
+    train_x = _to_2d_float_array(train_values, "train_values")
+    apply_x = _to_2d_float_array(values, "values")
 
     hmm_model = model or _build_hmm_model(
         n_components=n_components,
@@ -67,20 +104,32 @@ def generate_regime_weights(
         n_iter=n_iter,
         random_state=random_state,
     )
-    hmm_model.fit(x_hmm)
+    hmm_model.fit(train_x)
 
-    hmm_states = np.asarray(hmm_model.predict(x_hmm)).reshape(-1)
-    regimes = map_hmm_states_to_regimes(x_hmm, hmm_states)
+    train_states = np.asarray(hmm_model.predict(train_x)).reshape(-1)
+    train_regimes = map_hmm_states_to_regimes(train_x, train_states)
+    state_to_regime = _state_regime_mapping(train_states, train_regimes)
+    weights_by_regime = _weights_by_regime(train_regimes)
 
-    weighted["regime"] = regimes
-    regime_counts = weighted["regime"].value_counts(normalize=True)
-    inverse_frequency = 1.0 / regime_counts
-    weighted["sample_weight"] = weighted["regime"].map(inverse_frequency)
-    weighted["sample_weight"] = (
-        weighted["sample_weight"] / weighted["sample_weight"].max()
+    if apply_x.shape == train_x.shape and np.array_equal(apply_x, train_x):
+        apply_states = train_states
+    else:
+        apply_states = np.asarray(hmm_model.predict(apply_x)).reshape(-1)
+    if len(apply_states) != len(apply_x):
+        raise ValueError("HMM must return one state per input row")
+
+    regimes = np.asarray(
+        [
+            int(state_to_regime.get(int(state), Regime.HIGH_INFLATION))
+            for state in apply_states
+        ],
+        dtype=int,
     )
-
-    return weighted
+    sample_weights = np.asarray(
+        [weights_by_regime.get(int(regime), 1.0) for regime in regimes],
+        dtype=float,
+    )
+    return regimes, sample_weights
 
 
 class BISTResilientLSTM(nn.Module):
@@ -321,6 +370,41 @@ def create_purged_folds(
         raise ValueError("no valid folds were produced; reduce n_splits or embargo_days")
 
     return folds
+
+
+def _to_2d_float_array(values: Any, name: str) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    if array.ndim == 1:
+        array = array.reshape(-1, 1)
+    if array.ndim != 2 or array.shape[0] == 0:
+        raise ValueError(f"{name} must be a non-empty 2D array")
+    if array.shape[1] < 2:
+        raise ValueError(f"{name} must include return and volatility columns")
+    if not np.isfinite(array[:, :2]).all():
+        raise ValueError(f"{name} must contain only finite return and volatility values")
+    return array
+
+
+def _state_regime_mapping(
+    states: np.ndarray,
+    regimes: np.ndarray,
+) -> dict[int, int]:
+    if len(states) != len(regimes):
+        raise ValueError("states and regimes must align by row")
+
+    mapping: dict[int, int] = {}
+    for state in np.unique(states):
+        state_regimes = regimes[states == state]
+        values, counts = np.unique(state_regimes, return_counts=True)
+        mapping[int(state)] = int(values[np.argmax(counts)])
+    return mapping
+
+
+def _weights_by_regime(regimes: np.ndarray) -> dict[int, float]:
+    regime_counts = pd.Series(regimes).value_counts(normalize=True)
+    inverse_frequency = 1.0 / regime_counts
+    normalized = inverse_frequency / inverse_frequency.max()
+    return {int(regime): float(weight) for regime, weight in normalized.items()}
 
 
 def _build_hmm_model(
