@@ -1,8 +1,8 @@
 # Initial TRD
 
 Initial TRD is a research-oriented Turkish market trading strategy prototype.
-It provides feature engineering, regime-weighted LSTM training, purged
-walk-forward evaluation, and pair-trade signal generation.
+It provides feature engineering, regime-weighted LSTM training, benchmark
+purged walk-forward evaluation, and pair-trade signal generation.
 
 The project is source-only. Runtime data, trained models, and result files are
 generated locally under `data/` and `artifacts/` when you run the CLI.
@@ -50,11 +50,17 @@ walk-forward models. Use `tensorflow` only for `build_lstm_model(...)` in
 
 All relative paths are resolved from the current working directory.
 
-Fetch and align raw market data:
+Fetch and align raw market data. A real Turkey 5Y CDS CSV is required; the
+default path is `data/turkey_5y_cds.csv`.
 
 ```powershell
-trd-fetch-data
+trd-fetch-data --cds-csv data\turkey_5y_cds.csv
 ```
+
+The fetcher reads CPI from the TCMB page that republishes TURKSTAT annual CPI
+inflation, reads the CBRT one-week repo policy-rate history from the TCMB page
+configured by `--cbrt-rate-url`, and reads 5Y CDS levels from `--cds-csv`. It
+does not create synthetic macro data.
 
 Create engineered features:
 
@@ -88,13 +94,15 @@ Use the reported best epoch for the next `trd-train-lstm --epochs ...` run.
 Run the full default pipeline:
 
 ```powershell
-trd-run-pipeline --epochs 66 --device cuda
+trd-run-pipeline --cds-csv data\turkey_5y_cds.csv --epochs 66 --device cuda
 ```
 
 The pipeline runs fetch, weighted feature engineering, LSTM training,
-ridge walk-forward validation, and model-based signal generation. It writes
-`artifacts/pipeline_summary.json` with the pair, output paths, average
-walk-forward metrics, prediction, and final signal action.
+benchmark ridge walk-forward validation, and LSTM-based signal generation. The
+walk-forward metrics evaluate the configured benchmark model, not the saved
+LSTM that generates the signal. It writes `artifacts/pipeline_summary.json`
+with the pair, output paths, benchmark walk-forward metrics, prediction, and
+final signal action.
 
 The default pair is `THYAO.IS` vs `PGSUS.IS`. Change it like this:
 
@@ -104,12 +112,13 @@ trd-run-pipeline `
   --stock-b-ticker THYAO.IS `
   --stock-a-name ASELS `
   --stock-b-name THYAO `
+  --cds-csv data\turkey_5y_cds.csv `
   --epochs 66 `
   --device cuda
 ```
 
-`--hmm-random-state 7` and `--fetch-random-state 7` are reproducibility seeds.
-They make repeated runs comparable; they are not known-optimal values.
+`--hmm-random-state 7` is a model reproducibility seed. It makes repeated HMM
+weighting runs comparable; it is not a known-optimal value.
 
 Run dependency-free walk-forward validation:
 
@@ -174,6 +183,10 @@ market_breadth
 
 `target` is BIST return minus USD/TRY return, so model performance is measured
 against holding dollars rather than nominal Turkish lira gains.
+
+The CDS CSV may be an Investing.com export with `Date` and `Price` columns, or
+a Bloomberg/Refinitiv export with `Date` plus `PX_LAST`, `Close`, or
+`5Y_CDS_Spread`.
 
 Pair-trade inputs can be pandas Series of close prices or dataframes with a
 `close` column.

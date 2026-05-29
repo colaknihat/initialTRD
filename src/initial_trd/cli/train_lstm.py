@@ -26,6 +26,7 @@ DEFAULT_FEATURES = (
     "fx_volatility",
     "market_breadth",
 )
+MAX_SEQUENCE_GAP = pd.Timedelta(days=5)
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,28 +177,53 @@ def build_sequence_arrays(
         working[weight_column] = 1.0
 
     columns = feature_columns + [target_column, weight_column]
+    has_date_column = "date" in working.columns
+    if has_date_column and "date" not in columns:
+        columns.append("date")
     working = working.loc[:, columns].replace([np.inf, -np.inf], np.nan).dropna()
     if len(working) <= sequence_length:
         raise ValueError("not enough rows to build sequences")
 
-    feature_values = working.loc[:, feature_columns].to_numpy(dtype=np.float32)
-    targets = working.loc[:, target_column].to_numpy(dtype=np.float32)
-    weights = working.loc[:, weight_column].to_numpy(dtype=np.float32)
-
     x_rows = []
     y_rows = []
     weight_rows = []
-    for end in range(sequence_length, len(working)):
-        start = end - sequence_length
-        x_rows.append(feature_values[start:end])
-        y_rows.append(targets[end])
-        weight_rows.append(weights[end])
+    for segment in _contiguous_segments(working, has_date_column=has_date_column):
+        if len(segment) <= sequence_length:
+            continue
+
+        feature_values = segment.loc[:, feature_columns].to_numpy(dtype=np.float32)
+        targets = segment.loc[:, target_column].to_numpy(dtype=np.float32)
+        weights = segment.loc[:, weight_column].to_numpy(dtype=np.float32)
+
+        for end in range(sequence_length, len(segment)):
+            start = end - sequence_length
+            x_rows.append(feature_values[start:end])
+            y_rows.append(targets[end])
+            weight_rows.append(weights[end])
+
+    if not x_rows:
+        raise ValueError("not enough contiguous rows to build sequences")
 
     return (
         np.asarray(x_rows, dtype=np.float32),
         np.asarray(y_rows, dtype=np.float32).reshape(-1, 1),
         np.asarray(weight_rows, dtype=np.float32),
     )
+
+
+def _contiguous_segments(
+    working: pd.DataFrame,
+    *,
+    has_date_column: bool,
+) -> list[pd.DataFrame]:
+    if not has_date_column:
+        return [working]
+
+    dated = working.copy()
+    dated["date"] = pd.to_datetime(dated["date"])
+    dated = dated.sort_values("date")
+    gap_starts = dated["date"].diff() > MAX_SEQUENCE_GAP
+    return [segment for _, segment in dated.groupby(gap_starts.cumsum(), sort=False)]
 
 
 def build_loaders(

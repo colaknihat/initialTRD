@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated feature columns. Defaults to model metadata.",
     )
     parser.add_argument("--window", type=int, default=30)
-    parser.add_argument("--entry-z", type=float, default=-2.0)
+    parser.add_argument("--entry-z", type=float, default=2.0)
     parser.add_argument("--exit-z", type=float, default=0.5)
     parser.add_argument("--stock-a-name", default="stock_A")
     parser.add_argument("--stock-b-name", default="stock_B")

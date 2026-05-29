@@ -17,8 +17,11 @@ from initial_trd.cli.train_lstm import (
 from initial_trd.cli.signal import predict_from_saved_lstm
 from initial_trd.cli.walk_forward import build_model_factory
 from initial_trd.data_fetch import (
+    DEFAULT_CBRT_RATE_URL,
+    DEFAULT_CDS_CSV_PATH,
     DEFAULT_STOCK_A_TICKER,
     DEFAULT_STOCK_B_TICKER,
+    DEFAULT_TURKSTAT_CPI_URL,
     fetch_and_align_data,
 )
 from initial_trd.evaluation import run_walk_forward_test
@@ -43,6 +46,23 @@ from initial_trd.training import (
 )
 
 
+WALK_FORWARD_AVERAGE_METRIC_COLUMNS = (
+    "test_sharpe",
+    "test_max_dd",
+    "rmse",
+    "directional_accuracy",
+    "mean_strategy_return",
+)
+WALK_FORWARD_EVALUATION_NOTE = (
+    "Walk-forward metrics evaluate the configured benchmark model, not the saved "
+    "LSTM used for signal generation."
+)
+LSTM_SIGNAL_EVALUATION_NOTE = (
+    "The pipeline trains the LSTM once and uses it for the current signal; it does "
+    "not run an out-of-sample LSTM walk-forward evaluation."
+)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the full Initial TRD research pipeline."
@@ -60,10 +80,19 @@ def parse_args() -> argparse.Namespace:
         help="Display name in signal output. Defaults to --stock-b-ticker.",
     )
     parser.add_argument(
-        "--fetch-random-state",
-        type=int,
-        default=7,
-        help="Seed for generated macro proxy data.",
+        "--cpi-url",
+        default=DEFAULT_TURKSTAT_CPI_URL,
+        help="TCMB/TURKSTAT CPI page URL.",
+    )
+    parser.add_argument(
+        "--cbrt-rate-url",
+        default=DEFAULT_CBRT_RATE_URL,
+        help="TCMB policy-rate page URL or FRED-compatible CSV URL.",
+    )
+    parser.add_argument(
+        "--cds-csv",
+        default=str(DEFAULT_CDS_CSV_PATH),
+        help="Turkey 5Y CDS CSV from Bloomberg, Refinitiv, or Investing.com.",
     )
     parser.add_argument(
         "--hmm-random-state",
@@ -79,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--features",
         default=",".join(DEFAULT_FEATURES),
-        help="Comma-separated feature columns for LSTM and walk-forward tests.",
+        help="Comma-separated feature columns for the LSTM and benchmark walk-forward tests.",
     )
     parser.add_argument("--target", default="target")
     parser.add_argument("--weight-column", default="sample_weight")
@@ -104,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embargo-days", type=int, default=15)
     parser.add_argument("--regime", type=int, default=1)
     parser.add_argument("--window", type=int, default=30)
-    parser.add_argument("--entry-z", type=float, default=-2.0)
+    parser.add_argument("--entry-z", type=float, default=2.0)
     parser.add_argument("--exit-z", type=float, default=0.5)
     parser.add_argument(
         "--summary-output",
@@ -135,14 +164,16 @@ def main() -> None:
     print(f"Epochs: {args.epochs}")
     print(f"Feature regime weights: {'yes' if use_regime_weights else 'no'}")
     print(f"HMM random state: {args.hmm_random_state}")
-    print(f"Walk-forward model: {args.walk_forward_model}")
+    print(f"Walk-forward benchmark model: {args.walk_forward_model}")
     print()
 
     print("Step 1/5: Fetching data")
     fetch_and_align_data(
         stock_a_ticker=args.stock_a_ticker,
         stock_b_ticker=args.stock_b_ticker,
-        random_state=args.fetch_random_state,
+        cpi_url=args.cpi_url,
+        cbrt_rate_url=args.cbrt_rate_url,
+        cds_csv=args.cds_csv,
     )
 
     print()
@@ -230,7 +261,7 @@ def main() -> None:
     print(f"Saved model to {model_path}")
 
     print()
-    print("Step 4/5: Running walk-forward validation")
+    print("Step 4/5: Running benchmark walk-forward validation")
     walk_forward_args = argparse.Namespace(
         model=args.walk_forward_model,
         ridge_alpha=args.ridge_alpha,
@@ -244,11 +275,16 @@ def main() -> None:
         n_splits=args.n_splits,
         embargo_days=args.embargo_days,
     )
+    walk_forward_results = annotate_walk_forward_results(
+        walk_forward_results,
+        model_name=args.walk_forward_model,
+    )
     walk_forward_path = resolve_project_path(WALK_FORWARD_RESULTS_PATH)
     walk_forward_path.parent.mkdir(parents=True, exist_ok=True)
     walk_forward_results.to_csv(walk_forward_path, index=False)
     print(walk_forward_results.to_string(index=False))
     print(f"Wrote results to {walk_forward_path}")
+    print(WALK_FORWARD_EVALUATION_NOTE)
 
     print()
     print("Step 5/5: Generating signal")
@@ -286,6 +322,10 @@ def main() -> None:
     print(f"Wrote instruction to {signal_path}")
 
     summary_path = resolve_project_path(args.summary_output)
+    walk_forward_evaluation = build_walk_forward_evaluation_summary(
+        walk_forward_results,
+        model_name=args.walk_forward_model,
+    )
     summary = {
         "stock_a_ticker": args.stock_a_ticker,
         "stock_b_ticker": args.stock_b_ticker,
@@ -300,20 +340,45 @@ def main() -> None:
         "signal_path": str(signal_path),
         "signal_action": instruction.action,
         "predicted_return": float(prediction),
-        "walk_forward_average_metrics": {
-            column: float(walk_forward_results[column].mean())
-            for column in (
-                "test_sharpe",
-                "test_max_dd",
-                "rmse",
-                "directional_accuracy",
-                "mean_strategy_return",
-            )
+        "walk_forward_evaluation": walk_forward_evaluation,
+        "lstm_signal_evaluation": {
+            "model": "saved_lstm",
+            "evaluated_out_of_sample_in_pipeline": False,
+            "note": LSTM_SIGNAL_EVALUATION_NOTE,
         },
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote pipeline summary to {summary_path}")
+
+
+def annotate_walk_forward_results(
+    results: pd.DataFrame,
+    *,
+    model_name: str,
+) -> pd.DataFrame:
+    annotated = results.copy()
+    annotated.insert(1, "evaluation_target", "benchmark_model")
+    annotated.insert(2, "model_name", model_name)
+    annotated.insert(3, "evaluates_saved_lstm", False)
+    return annotated
+
+
+def build_walk_forward_evaluation_summary(
+    results: pd.DataFrame,
+    *,
+    model_name: str,
+) -> dict[str, object]:
+    return {
+        "evaluation_target": "benchmark_model",
+        "model_name": model_name,
+        "evaluates_saved_lstm": False,
+        "note": WALK_FORWARD_EVALUATION_NOTE,
+        "average_metrics": {
+            column: float(results[column].mean())
+            for column in WALK_FORWARD_AVERAGE_METRIC_COLUMNS
+        },
+    }
 
 
 if __name__ == "__main__":

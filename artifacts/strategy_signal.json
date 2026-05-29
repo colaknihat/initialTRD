@@ -1,9 +1,9 @@
 {
   "action": "CLOSE",
   "reason": "spread mean reversion target reached",
-  "z_score": -0.45672739371255144,
+  "z_score": -0.24649275697059733,
   "regime": 1,
-  "predicted_return": -0.003813450690358877,
+  "predicted_return": 0.0014298162423074245,
   "long_leg": null,
   "short_leg": null,
   "stock_a_name": "THYAO.IS",

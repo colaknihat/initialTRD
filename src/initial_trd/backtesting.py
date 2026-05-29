@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 from initial_trd.cli.train_lstm import build_loaders, build_sequence_arrays
-from initial_trd.strategy import Regime, TradeInstruction
+from initial_trd.strategy import Regime, TradeInstruction, generate_pairs_trade_signal
 from initial_trd.training import (
     BISTResilientLSTM,
     generate_regime_weights,
@@ -21,6 +21,7 @@ from initial_trd.training import (
 
 
 PredictionSource = Mapping[pd.Timestamp, float] | Callable[[pd.Timestamp], float]
+RegimeSource = int | Mapping[pd.Timestamp, int] | Callable[[pd.Timestamp], int]
 
 
 @dataclass(frozen=True)
@@ -42,81 +43,16 @@ def generate_symmetric_pair_signal(
     stock_b_name: str = "stock_B",
 ) -> TradeInstruction:
     """Return a two-sided pair signal from the current spread z-score."""
-
-    if window < 2:
-        raise ValueError("window must be at least 2")
-    entry_threshold = abs(float(entry_z))
-    exit_threshold = abs(float(exit_z))
-    if entry_threshold <= 0.0:
-        raise ValueError("entry_z must be non-zero")
-
-    close_a = pd.Series(stock_a, dtype=float).rename("stock_a")
-    close_b = pd.Series(stock_b, dtype=float).rename("stock_b")
-    prices = pd.concat([close_a, close_b], axis=1).dropna()
-    if len(prices) < window:
-        raise ValueError(f"at least {window} aligned close prices are required")
-
-    spread = prices["stock_a"] - prices["stock_b"]
-    rolling_mean = spread.rolling(window).mean()
-    rolling_std = spread.rolling(window).std()
-    current_z = float(((spread - rolling_mean) / rolling_std).iloc[-1])
-    regime_value = int(np.asarray(regime, dtype=int).reshape(-1)[0])
-    predicted_return = float(np.asarray(lstm_prediction, dtype=float).reshape(-1)[0])
-
-    if not np.isfinite(current_z):
-        return TradeInstruction(
-            action="HOLD",
-            reason="z-score is unavailable for the latest window",
-            z_score=current_z,
-            regime=regime_value,
-            predicted_return=predicted_return,
-        )
-
-    if (
-        regime_value == Regime.DISINFLATION
-        and predicted_return > 0.0
-        and current_z < -entry_threshold
-    ):
-        return TradeInstruction(
-            action="OPEN_PAIR",
-            reason="negative spread z-score, positive momentum",
-            z_score=current_z,
-            regime=regime_value,
-            predicted_return=predicted_return,
-            long_leg=stock_a_name,
-            short_leg=stock_b_name,
-        )
-
-    if (
-        regime_value == Regime.DISINFLATION
-        and predicted_return > 0.0
-        and current_z > entry_threshold
-    ):
-        return TradeInstruction(
-            action="OPEN_PAIR",
-            reason="positive spread z-score, positive momentum",
-            z_score=current_z,
-            regime=regime_value,
-            predicted_return=predicted_return,
-            long_leg=stock_b_name,
-            short_leg=stock_a_name,
-        )
-
-    if abs(current_z) < exit_threshold:
-        return TradeInstruction(
-            action="CLOSE",
-            reason="spread mean reversion target reached",
-            z_score=current_z,
-            regime=regime_value,
-            predicted_return=predicted_return,
-        )
-
-    return TradeInstruction(
-        action="HOLD",
-        reason="entry and exit conditions are not met",
-        z_score=current_z,
-        regime=regime_value,
-        predicted_return=predicted_return,
+    return generate_pairs_trade_signal(
+        stock_a,
+        stock_b,
+        regime,
+        lstm_prediction,
+        window=window,
+        entry_z=entry_z,
+        exit_z=exit_z,
+        stock_a_name=stock_a_name,
+        stock_b_name=stock_b_name,
     )
 
 
@@ -147,7 +83,7 @@ def simulate_pair_backtest(
     tickers: Sequence[str] | None = None,
     days: int = 30,
     initial_capital: float = 100.0,
-    regime: int = int(Regime.DISINFLATION),
+    regime: RegimeSource = int(Regime.DISINFLATION),
     window: int = 30,
     entry_z: float = 2.0,
     exit_z: float = 0.5,
@@ -169,13 +105,14 @@ def simulate_pair_backtest(
 
     for signal_date, next_date in zip(test_dates[:-1], test_dates[1:]):
         predicted_return = _prediction_for_date(predictions, signal_date)
+        regime_value = _regime_for_date(regime, signal_date)
 
         for stock_a, stock_b in pairs:
             pair_key = (stock_a, stock_b)
             instruction = generate_symmetric_pair_signal(
                 common.loc[:signal_date, stock_a],
                 common.loc[:signal_date, stock_b],
-                regime,
+                regime_value,
                 predicted_return,
                 window=window,
                 entry_z=entry_z,
@@ -250,6 +187,51 @@ def simulate_pair_backtest(
         initial_capital=initial_capital,
     )
     return PairBacktestResult(rows=row_frame, summary=summary)
+
+
+def classify_backtest_regimes_by_date(
+    features_df: pd.DataFrame,
+    signal_dates: Sequence[pd.Timestamp],
+    *,
+    model_factory: Callable[[], Any] | None = None,
+    n_components: int = 4,
+    covariance_type: str = "diag",
+    n_iter: int = 200,
+    random_state: int | None = None,
+) -> dict[pd.Timestamp, int]:
+    """Classify the latest semantic HMM regime available for each signal date."""
+
+    if "date" not in features_df.columns:
+        raise ValueError("features_df must include a date column")
+    if n_components < 1:
+        raise ValueError("n_components must be at least 1")
+
+    history = features_df.copy()
+    history["date"] = pd.to_datetime(history["date"])
+    history = history.sort_values("date")
+
+    regimes: dict[pd.Timestamp, int] = {}
+    for signal_date in signal_dates:
+        timestamp = pd.Timestamp(signal_date)
+        available = history.loc[history["date"] <= timestamp].copy()
+        if len(available) < n_components:
+            raise ValueError(
+                "not enough feature rows are available through "
+                f"{_date_string(timestamp)} to classify regimes"
+            )
+
+        model = model_factory() if model_factory is not None else None
+        weighted = generate_regime_weights(
+            available,
+            model=model,
+            n_components=n_components,
+            covariance_type=covariance_type,
+            n_iter=n_iter,
+            random_state=random_state,
+        )
+        regimes[timestamp] = int(weighted["regime"].iloc[-1])
+
+    return regimes
 
 
 def calculate_pair_return(
@@ -528,6 +510,25 @@ def _prediction_for_date(predictions: PredictionSource, date: pd.Timestamp) -> f
     if normalized in predictions:
         return float(predictions[normalized])
     raise KeyError(f"missing prediction for {_date_string(timestamp)}")
+
+
+def _regime_for_date(regimes: RegimeSource, date: pd.Timestamp) -> int:
+    timestamp = pd.Timestamp(date)
+    if callable(regimes):
+        return int(regimes(timestamp))
+    if isinstance(regimes, Mapping):
+        if timestamp in regimes:
+            return int(regimes[timestamp])
+
+        normalized = pd.Timestamp(timestamp.date())
+        if normalized in regimes:
+            return int(regimes[normalized])
+        raise KeyError(f"missing regime for {_date_string(timestamp)}")
+
+    values = np.asarray(regimes, dtype=int).reshape(-1)
+    if values.size != 1:
+        raise ValueError("regime must contain exactly one value")
+    return int(values[0])
 
 
 def _account_values(initial_capital: float, ending_value: float) -> dict[str, float]:

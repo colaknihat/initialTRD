@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from initial_trd.backtesting import (
+    classify_backtest_regimes_by_date,
     resolve_device,
     select_common_trading_dates,
     simulate_pair_backtest,
@@ -14,7 +15,10 @@ from initial_trd.backtesting import (
 )
 from initial_trd.cli.train_lstm import DEFAULT_FEATURES, _parse_columns
 from initial_trd.data_fetch import (
+    DEFAULT_CBRT_RATE_URL,
     DEFAULT_BREADTH_TICKERS,
+    DEFAULT_CDS_CSV_PATH,
+    DEFAULT_TURKSTAT_CPI_URL,
     END_DATE,
     START_DATE,
     fetch_and_align_data,
@@ -38,16 +42,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default=START_DATE)
     parser.add_argument("--end-date", default=END_DATE)
     parser.add_argument(
-        "--fetch-random-state",
-        type=int,
-        default=7,
-        help="Seed for generated macro proxy data.",
+        "--cpi-url",
+        default=DEFAULT_TURKSTAT_CPI_URL,
+        help="TCMB/TURKSTAT CPI page URL.",
+    )
+    parser.add_argument(
+        "--cbrt-rate-url",
+        default=DEFAULT_CBRT_RATE_URL,
+        help="TCMB policy-rate page URL or FRED-compatible CSV URL.",
+    )
+    parser.add_argument(
+        "--cds-csv",
+        default=str(DEFAULT_CDS_CSV_PATH),
+        help="Turkey 5Y CDS CSV from Bloomberg, Refinitiv, or Investing.com.",
     )
     parser.add_argument(
         "--hmm-random-state",
         type=int,
         default=7,
-        help="Seed for HMM regime weighting.",
+        help="Seed for HMM regime weighting and backtest regime classification.",
     )
     parser.add_argument(
         "--no-regime-weights",
@@ -72,7 +85,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda.")
-    parser.add_argument("--regime", type=int, default=1)
     parser.add_argument("--window", type=int, default=30)
     parser.add_argument(
         "--entry-z",
@@ -120,7 +132,9 @@ def main() -> None:
         breadth_tickers=tickers,
         start_date=args.start_date,
         end_date=args.end_date,
-        random_state=args.fetch_random_state,
+        cpi_url=args.cpi_url,
+        cbrt_rate_url=args.cbrt_rate_url,
+        cds_csv=args.cds_csv,
     )
     stock_closes = fetch_stock_closes(
         tickers,
@@ -136,8 +150,17 @@ def main() -> None:
     print(f"Feature rows: {len(features_df)}")
 
     print()
-    print("Step 3/4: Daily LSTM retraining")
+    print("Step 3/5: Classifying daily HMM regimes")
     test_dates = select_common_trading_dates(stock_closes, tickers, days=args.days)
+    regimes = classify_backtest_regimes_by_date(
+        features_df,
+        test_dates[:-1],
+        random_state=args.hmm_random_state,
+    )
+    print(f"Regime classifications: {len(regimes)}")
+
+    print()
+    print("Step 4/5: Daily LSTM retraining")
     predictions = train_lstm_predictions_by_date(
         features_df,
         test_dates[:-1],
@@ -160,14 +183,14 @@ def main() -> None:
     )
 
     print()
-    print("Step 4/4: Simulating pair trades")
+    print("Step 5/5: Simulating pair trades")
     result = simulate_pair_backtest(
         stock_closes,
         predictions,
         tickers=tickers,
         days=args.days,
         initial_capital=100.0,
-        regime=args.regime,
+        regime=regimes,
         window=args.window,
         entry_z=args.entry_z,
         exit_z=args.exit_z,

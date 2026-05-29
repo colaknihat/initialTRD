@@ -7,17 +7,12 @@ logic can be tested without placing real orders.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 import pandas as pd
 
-
-class Regime(IntEnum):
-    HIGH_INFLATION = 0
-    DISINFLATION = 1
-    CRISIS = 2
+from initial_trd.regimes import Regime, map_hmm_states_to_regimes
 
 
 @dataclass(frozen=True)
@@ -44,7 +39,11 @@ def classify_regime(
     n_iter: int = 100,
     random_state: Optional[int] = None,
 ) -> int:
-    """Fit an HMM on macro data and return the latest inferred regime."""
+    """Fit an HMM and return the latest semantic regime.
+
+    The first input feature is treated as returns and the second as volatility
+    when assigning HMM states to ``Regime`` values.
+    """
 
     values = _to_2d_float_array(macro_data, "macro_data")
     fitted_model = model or _build_hmm_model(
@@ -55,11 +54,10 @@ def classify_regime(
     )
 
     fitted_model.fit(values)
-    prediction = np.asarray(fitted_model.predict(values[-1:])).reshape(-1)
-    if prediction.size != 1:
-        raise ValueError("HMM prediction must contain exactly one regime")
+    hmm_states = np.asarray(fitted_model.predict(values)).reshape(-1)
+    regimes = map_hmm_states_to_regimes(values, hmm_states)
 
-    return int(prediction[0])
+    return int(regimes[-1])
 
 
 def build_lstm_model(timesteps: int, feature_count: int) -> Any:
@@ -125,15 +123,19 @@ def generate_pairs_trade_signal(
     lstm_prediction: Any,
     *,
     window: int = 30,
-    entry_z: float = -2.0,
+    entry_z: float = 2.0,
     exit_z: float = 0.5,
     stock_a_name: str = "stock_A",
     stock_b_name: str = "stock_B",
 ) -> TradeInstruction:
-    """Return the pair-trade instruction implied by the current inputs."""
+    """Return the two-sided pair-trade instruction implied by the current inputs."""
 
     if window < 2:
         raise ValueError("window must be at least 2")
+    entry_threshold = abs(float(entry_z))
+    exit_threshold = abs(float(exit_z))
+    if entry_threshold <= 0.0:
+        raise ValueError("entry_z must be non-zero")
 
     close_a = _extract_close_series(stock_a, "stock_a")
     close_b = _extract_close_series(stock_b, "stock_b")
@@ -164,8 +166,8 @@ def generate_pairs_trade_signal(
 
     if (
         regime_value == Regime.DISINFLATION
-        and current_z < entry_z
         and predicted_return > 0.0
+        and current_z < -entry_threshold
     ):
         return TradeInstruction(
             action="OPEN_PAIR",
@@ -177,7 +179,22 @@ def generate_pairs_trade_signal(
             short_leg=stock_b_name,
         )
 
-    if abs(current_z) < exit_z:
+    if (
+        regime_value == Regime.DISINFLATION
+        and predicted_return > 0.0
+        and current_z > entry_threshold
+    ):
+        return TradeInstruction(
+            action="OPEN_PAIR",
+            reason="disinflation regime, positive spread z-score, positive momentum",
+            z_score=current_z,
+            regime=regime_value,
+            predicted_return=predicted_return,
+            long_leg=stock_b_name,
+            short_leg=stock_a_name,
+        )
+
+    if abs(current_z) < exit_threshold:
         return TradeInstruction(
             action="CLOSE",
             reason="spread mean reversion target reached",
@@ -204,7 +221,7 @@ def execute_pairs_trade(
     order_executor: Optional[OrderExecutor] = None,
     position_closer: Optional[PositionCloser] = None,
     window: int = 30,
-    entry_z: float = -2.0,
+    entry_z: float = 2.0,
     exit_z: float = 0.5,
     stock_a_name: str = "stock_A",
     stock_b_name: str = "stock_B",
@@ -224,7 +241,11 @@ def execute_pairs_trade(
     )
 
     if instruction.action == "OPEN_PAIR" and order_executor is not None:
-        order_executor("BUY", stock_a, hedge="SHORT", hedge_asset=stock_b)
+        if instruction.long_leg == stock_a_name:
+            long_asset, short_asset = stock_a, stock_b
+        else:
+            long_asset, short_asset = stock_b, stock_a
+        order_executor("BUY", long_asset, hedge="SHORT", hedge_asset=short_asset)
     elif instruction.action == "CLOSE" and position_closer is not None:
         position_closer()
 

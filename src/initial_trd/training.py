@@ -10,6 +10,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+from initial_trd.regimes import map_hmm_states_to_regimes
+
 
 REQUIRED_FEATURE_INPUT_COLUMNS = (
     "BIST100",
@@ -67,11 +69,10 @@ def generate_regime_weights(
     )
     hmm_model.fit(x_hmm)
 
-    regimes = np.asarray(hmm_model.predict(x_hmm)).reshape(-1)
-    if len(regimes) != len(weighted):
-        raise ValueError("HMM must return one regime per input row")
+    hmm_states = np.asarray(hmm_model.predict(x_hmm)).reshape(-1)
+    regimes = map_hmm_states_to_regimes(x_hmm, hmm_states)
 
-    weighted["regime"] = regimes.astype(int)
+    weighted["regime"] = regimes
     regime_counts = weighted["regime"].value_counts(normalize=True)
     inverse_frequency = 1.0 / regime_counts
     weighted["sample_weight"] = weighted["regime"].map(inverse_frequency)

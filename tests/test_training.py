@@ -67,18 +67,19 @@ class TrainModelTests(unittest.TestCase):
     def test_generate_regime_weights_uses_inverse_frequency(self):
         df = pd.DataFrame(
             {
-                "bist_ret": [0.01, 0.02, -0.03, 0.04],
-                "fx_volatility": [0.2, 0.1, 0.4, 0.3],
+                "bist_ret": [-0.04, -0.03, 0.04, 0.06, 0.01],
+                "fx_volatility": [0.8, 0.7, 0.1, 0.6, 0.4],
             }
         )
-        model = FakeHMM([0, 0, 0, 1])
+        model = FakeHMM([7, 7, 3, 5, 9])
 
         result = generate_regime_weights(df, model=model)
 
         np.testing.assert_allclose(model.fit_data, df.to_numpy(dtype=float))
-        self.assertEqual(result["regime"].tolist(), [0, 0, 0, 1])
-        self.assertAlmostEqual(result.loc[0, "sample_weight"], 1.0 / 3.0)
-        self.assertAlmostEqual(result.loc[3, "sample_weight"], 1.0)
+        self.assertEqual(result["regime"].tolist(), [2, 2, 1, 0, 0])
+        self.assertAlmostEqual(result.loc[0, "sample_weight"], 0.5)
+        self.assertAlmostEqual(result.loc[2, "sample_weight"], 1.0)
+        self.assertAlmostEqual(result.loc[3, "sample_weight"], 0.5)
 
     def test_create_purged_folds_creates_expanding_embargoed_splits(self):
         df = pd.DataFrame({"value": range(30)})
